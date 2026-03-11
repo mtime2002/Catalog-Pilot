@@ -1,0 +1,1175 @@
+@page "/inventory/add"
+@rendermode InteractiveServer
+@attribute [Authorize]
+@using CatalogPilot.Models
+@using System.Text.Json
+@implements IAsyncDisposable
+@inject AuthenticationStateProvider AuthenticationStateProvider
+@inject IPhotoStorageService PhotoStorageService
+@inject IVideoGameClassifierService ClassifierService
+@inject IEbayPricingService PricingService
+@inject IInventoryStore InventoryStore
+@inject IJSRuntime JSRuntime
+
+<PageTitle>Add Inventory</PageTitle>
+
+<main class="page-shell inventory-add-shell">
+    <header class="hero">
+        <h1>Add to Inventory</h1>
+        <p>Upload photos first, let attributes auto-fill in the background, and override anything directly in the attributes bar.</p>
+        <p style="margin-top:0.6rem;"><a href="/inventory">View inventory</a> | <a href="/inventory/list-inactive">Open listing queue</a></p>
+    </header>
+    @if (!string.IsNullOrWhiteSpace(_errorMessage))
+    {
+        <div class="status status-error">@_errorMessage</div>
+    }
+    @if (!string.IsNullOrWhiteSpace(_statusMessage))
+    {
+        <div class="status status-ok">@_statusMessage</div>
+    }
+
+    <section class="panel">
+        <div class="button-row" style="margin-top:0.75rem;">
+            <button type="button" class="btn btn-primary" @onclick="AddDraft">Add Another Item</button>
+            <button type="button" class="btn btn-danger" @onclick="ClearAllDraftsAsync">Clear Drafts</button>
+        </div>
+    </section>
+
+    @for (var index = 0; index < _drafts.Count; index++)
+    {
+        var draft = _drafts[index];
+        <section class="panel inventory-draft-card">
+            @if (!string.IsNullOrWhiteSpace(draft.ErrorMessage))
+            {
+                <div class="status status-error">@draft.ErrorMessage</div>
+            }
+            @if (!string.IsNullOrWhiteSpace(draft.Message))
+            {
+                <div class="status-chip status-chip-inactive">@draft.Message</div>
+            }
+
+            <div class="inventory-condensed-row">
+                <button type="button" class="inventory-condensed-toggle" @onclick="() => ToggleAttributes(draft.Id)">
+                    @(draft.ShowAttributes ? "\u25B2" : "\u25BC")
+                </button>
+                <div class="inventory-condensed-media">
+                    <div class="inventory-thumb-strip">
+                        @foreach (var photo in draft.Input.Photos)
+                        {
+                            <button type="button"
+                                    class="add-inventory-thumb-btn"
+                                    @onclick="() => OpenImagePreview(photo)"
+                                    aria-label="Open image preview">
+                                <img class="add-inventory-thumb" src="@photo.RelativeUrl" alt="@photo.FileName" />
+                            </button>
+                        }
+
+                        <label class="inventory-thumb-add" for="@($"draft-upload-{draft.Id}")" title="Add images">
+                            <span>+</span>
+                            <small>Add</small>
+                        </label>
+                    </div>
+                    <InputFile id="@($"draft-upload-{draft.Id}")"
+                               class="inventory-thumb-input"
+                               OnChange="@(e => HandleFilesSelectedAsync(draft, e))"
+                               multiple
+                               accept="image/*" />
+                </div>
+
+                <div class="inventory-condensed-main">
+                    <label>
+                        Title
+                        <input class="input"
+                                @bind="draft.Input.ItemName"
+                                @bind:event="oninput"
+                                @bind:after="HandleDraftFieldChangedAsync"
+                                placeholder="Auto-filled from images when available" />
+                    </label>
+                    <label>
+                        Platform
+                        <input class="input"
+                                @bind="draft.Input.Platform"
+                                @bind:event="oninput"
+                                @bind:after="HandleDraftFieldChangedAsync"
+                                placeholder="Auto-filled from images when available" />
+                    </label>
+
+                    @if (draft.ShowAttributes)
+                    {
+                        <section class="attributes-drawer">
+                            <div class="field-grid">
+                                <label>
+                                    Condition
+                                    <select class="input" @bind="draft.Input.Condition" @bind:after="HandleDraftFieldChangedAsync">
+                                        <option value="Used">Used</option>
+                                        <option value="New">New</option>
+                                        <option value="For parts or not working">For parts or not working</option>
+                                    </select>
+                                </label>
+                                <label>
+                                    Quantity
+                                    <input class="input" type="number" min="1" max="20" @bind="draft.Input.Quantity" @bind:after="HandleDraftFieldChangedAsync" />
+                                </label>
+                                <label>
+                                    Price (USD)
+                                    <input class="input" type="number" step="0.01" min="0.01" @bind="draft.Input.UserPriceOverride" @bind:after="HandleDraftFieldChangedAsync" />
+                                </label>
+                                <label class="checkbox-row">
+                                    <input type="checkbox" @bind="draft.Input.IsSealed" @bind:after="HandleDraftFieldChangedAsync" />
+                                    Factory sealed
+                                </label>
+                            </div>
+                            <label class="description-field inventory-condensed-description">
+                                Description
+                                <textarea class="input text-area"
+                                          @bind="draft.Input.Description"
+                                          @bind:event="oninput"
+                                          @bind:after="HandleDraftFieldChangedAsync"></textarea>
+                            </label>
+
+                            <div style="margin-top:0.75rem;">
+                                <h4 style="margin:0 0 0.45rem;">Item Attributes</h4>
+                                @if (draft.AttributeRows.Count == 0)
+                                {
+                                    <p class="muted">No attributes yet. Auto-fill will add them when available.</p>
+                                }
+                                @foreach (var row in draft.AttributeRows)
+                                {
+                                    <div class="manual-specific-row">
+                                        <input class="input" placeholder="Attribute" @bind="row.Key" @bind:event="oninput" @bind:after="HandleDraftFieldChangedAsync" />
+                                        <input class="input" placeholder="Value" @bind="row.Value" @bind:event="oninput" @bind:after="HandleDraftFieldChangedAsync" />
+                                        <button type="button" class="btn btn-danger" @onclick="() => RemoveAttributeRow(draft.Id, row.Id)">Remove</button>
+                                    </div>
+                                }
+                                <div class="button-row" style="margin-top:0.55rem;">
+                                    <button type="button" class="btn" @onclick="() => AddAttributeRow(draft.Id)">Add Attribute</button>
+                                </div>
+                            </div>
+                        </section>
+                    }
+                </div>
+                <div class="button-row inventory-condensed-actions">
+                    <button type="button"
+                            class="btn btn-primary"
+                            @onclick="() => ConfirmAddToInventoryAsync(draft)"
+                            disabled="@draft.IsSaving"
+                            title="Add to inventory">
+                        +
+                    </button>
+                    <button type="button" 
+                        class="btn btn-danger"
+                        @onclick="() => RemoveDraft(draft.Id)" 
+                        disabled="@(_drafts.Count == 1 || draft.IsSaving)"
+                        title="Delete">
+                        x
+                    </button>
+                </div>
+            </div>
+        </section>
+    }
+
+    <section class="panel">
+        <h2>Added This Session</h2>
+        @if (_sessionAddedItems.Count == 0)
+        {
+            <p class="muted">No items added in this session yet.</p>
+        }
+        else
+        {
+            <table class="comp-table">
+                <thead>
+                    <tr>
+                        <th>Item</th>
+                        <th>Platform</th>
+                        <th>Qty</th>
+                        <th>Status</th>
+                        <th>Added</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var added in _sessionAddedItems.OrderByDescending(item => item.AddedUtc))
+                    {
+                        <tr>
+                            <td>@DisplayOrFallback(added.ItemName)</td>
+                            <td>@DisplayOrFallback(added.Platform)</td>
+                            <td>@added.Quantity</td>
+                            <td><span class="status-chip status-chip-inactive">@added.Status</span></td>
+                            <td>@added.AddedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")</td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        }
+    </section>
+</main>
+
+@if (!string.IsNullOrWhiteSpace(_expandedImageUrl))
+{
+    <div class="modal-overlay" @onclick="CloseImagePreview">
+        <section class="panel image-preview-card" @onclick:stopPropagation="true">
+            <header class="inventory-modal-head">
+                <h3>Image Preview</h3>
+                <button type="button" class="btn" @onclick="CloseImagePreview">Close</button>
+            </header>
+            <img class="image-preview-full" src="@_expandedImageUrl" alt="@_expandedImageName" />
+        </section>
+    </div>
+}
+
+@code {
+    private const string DraftCacheKey = "catalogpilot.inventory.add.drafts.v1";
+    private readonly List<InventoryDraft> _drafts = [];
+    private readonly List<SessionAddedItem> _sessionAddedItems = [];
+    private readonly JsonSerializerOptions _cacheJsonOptions = new(JsonSerializerDefaults.Web);
+    private Guid _currentUserId;
+    private bool _authLoaded;
+    private bool _cacheReady;
+    private CancellationTokenSource? _autosaveCts;
+    private Task? _autosaveTask;
+    private string? _expandedImageUrl;
+    private string _expandedImageName = string.Empty;
+    private string _statusMessage = string.Empty;
+    private string _errorMessage = string.Empty;
+
+    protected override async Task OnInitializedAsync()
+    {
+        var authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
+        _authLoaded = authState.User.TryGetUserId(out _currentUserId);
+        AddDraft();
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender)
+        {
+            return;
+        }
+
+        await RestoreDraftsFromCacheAsync();
+        StartDraftAutosave();
+    }
+
+    private void AddDraft()
+    {
+        _drafts.Add(new InventoryDraft());
+        _ = PersistDraftsAsync();
+    }
+
+    private void RemoveDraft(Guid draftId)
+    {
+        var index = _drafts.FindIndex(draft => draft.Id == draftId);
+        if (index < 0)
+        {
+            return;
+        }
+
+        RequestDraftAnalysisCancellation(_drafts[index]);
+        _drafts.RemoveAt(index);
+        if (_drafts.Count == 0)
+        {
+            AddDraft();
+            return;
+        }
+
+        _ = PersistDraftsAsync();
+    }
+
+    private void ToggleAttributes(Guid draftId)
+    {
+        var draft = _drafts.FirstOrDefault(item => item.Id == draftId);
+        if (draft is null)
+        {
+            return;
+        }
+
+        draft.ShowAttributes = !draft.ShowAttributes;
+        _ = PersistDraftsAsync();
+    }
+
+    private void AddAttributeRow(Guid draftId)
+    {
+        var draft = _drafts.FirstOrDefault(item => item.Id == draftId);
+        if (draft is null)
+        {
+            return;
+        }
+
+        draft.AttributeRows.Add(new DraftAttributeRow());
+        _ = PersistDraftsAsync();
+    }
+
+    private void RemoveAttributeRow(Guid draftId, Guid rowId)
+    {
+        var draft = _drafts.FirstOrDefault(item => item.Id == draftId);
+        if (draft is null)
+        {
+            return;
+        }
+
+        var index = draft.AttributeRows.FindIndex(row => row.Id == rowId);
+        if (index >= 0)
+        {
+            draft.AttributeRows.RemoveAt(index);
+            _ = PersistDraftsAsync();
+        }
+    }
+
+    private async Task ConfirmAddToInventoryAsync(InventoryDraft draft)
+    {
+        if (!await ConfirmAsync("Add this item to inventory?"))
+        {
+            return;
+        }
+
+        await AddToInventoryAsync(draft);
+    }
+
+    private async Task ClearDraftAsync(InventoryDraft draft)
+    {
+        if (!await ConfirmAsync("Clear this draft item? This removes its photos, details, and suggested attributes."))
+        {
+            return;
+        }
+
+        RequestDraftAnalysisCancellation(draft);
+        ResetDraft(draft);
+        draft.Message = "Draft cleared.";
+        draft.ErrorMessage = string.Empty;
+        await PersistDraftsAsync();
+    }
+
+    private async Task ClearAllDraftsAsync()
+    {
+        if (!await ConfirmAsync("Clear all draft items?"))
+        {
+            return;
+        }
+
+        CancelAllDraftAnalyses();
+        _drafts.Clear();
+        _sessionAddedItems.Clear();
+        AddDraft();
+        await PersistDraftsAsync();
+    }
+
+    private Task HandleDraftFieldChangedAsync()
+    {
+        return PersistDraftsAsync();
+    }
+
+    private async Task HandleFilesSelectedAsync(InventoryDraft draft, InputFileChangeEventArgs e)
+    {
+        draft.ErrorMessage = string.Empty;
+        draft.Message = string.Empty;
+        try
+        {
+            RequestDraftAnalysisCancellation(draft);
+            var files = e.GetMultipleFiles(12);
+            var uploaded = await PhotoStorageService.SaveAsync(files);
+            draft.Input.Photos.AddRange(uploaded);
+
+            if (uploaded.Count == 0)
+            {
+                draft.Message = "No photos uploaded.";
+                return;
+            }
+
+            draft.Message = "Checking barcodes and autofilling...";
+            draft.AnalysisVersion++;
+            var version = draft.AnalysisVersion;
+            var analysisCts = new CancellationTokenSource();
+            draft.AnalysisCts = analysisCts;
+            draft.IsAnalyzing = true;
+            _ = AnalyzeDraftAsync(draft, version, analysisCts);
+            await PersistDraftsAsync();
+        }
+        catch (Exception ex)
+        {
+            draft.ErrorMessage = ex.Message;
+        }
+    }
+
+    private async Task AnalyzeDraftAsync(InventoryDraft draft, int version, CancellationTokenSource analysisCts)
+    {
+        try
+        {
+            await InvokeAsync(() =>
+            {
+                draft.IsAnalyzing = true;
+                draft.ErrorMessage = string.Empty;
+                StateHasChanged();
+            });
+
+            ClassificationResult? classification = null;
+            PriceSuggestionResult? pricing = null;
+            string? error = null;
+            var canceled = false;
+            var postSaveUpdated = false;
+
+            var snapshot = CloneListingInput(draft.Input);
+
+            try
+            {
+                classification = await ClassifierService.ClassifyAsync(snapshot, analysisCts.Token);
+                ApplyClassificationDefaults(snapshot, classification);
+                pricing = await PricingService.SuggestPriceAsync(snapshot, classification, analysisCts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                canceled = true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+            }
+
+            if (!canceled &&
+                string.IsNullOrWhiteSpace(error) &&
+                classification is not null &&
+                draft.SavedInventoryItemId.HasValue &&
+                draft.PostSaveAutofillState is not null &&
+                !draft.PostSaveAutofillCompleted)
+            {
+                draft.PostSaveAutofillCompleted = true;
+                postSaveUpdated = await ApplyAutofillToSavedItemAsync(
+                    draft.PendingUserId,
+                    draft.SavedInventoryItemId.Value,
+                    classification,
+                    pricing,
+                    draft.PostSaveAutofillState);
+            }
+
+            await InvokeAsync(() =>
+            {
+                if (version != draft.AnalysisVersion || !ReferenceEquals(draft.AnalysisCts, analysisCts))
+                {
+                    return;
+                }
+
+                draft.AnalysisCts = null;
+                draft.IsAnalyzing = false;
+
+                if (canceled)
+                {
+                    draft.ErrorMessage = string.Empty;
+                    draft.Message = draft.Input.Photos.Count > 0
+                        ? "Autofill restarted with the latest photo set."
+                        : string.Empty;
+                    _ = PersistDraftsAsync();
+                    StateHasChanged();
+                    return;
+                }
+
+                if (!string.IsNullOrWhiteSpace(error))
+                {
+                    draft.ErrorMessage = error;
+                    draft.Message = string.Empty;
+                    StateHasChanged();
+                    return;
+                }
+
+                if (classification is not null)
+                {
+                    draft.SuggestedClassification = classification;
+                    ApplyClassificationDefaults(draft.Input, classification);
+                    MergeSuggestedAttributes(draft, classification.ItemSpecifics);
+                }
+
+                draft.SuggestedPricing = pricing;
+
+                if (postSaveUpdated)
+                {
+                    _statusMessage = "Background autofill updated a saved inventory item.";
+                }
+
+                _ = PersistDraftsAsync();
+                StateHasChanged();
+            });
+        }
+        finally
+        {
+            analysisCts.Dispose();
+        }
+    }
+
+    private async Task AddToInventoryAsync(InventoryDraft draft)
+    {
+        if (!_authLoaded || _currentUserId == Guid.Empty || draft.IsSaving)
+        {
+            return;
+        }
+
+        draft.IsSaving = true;
+        draft.ErrorMessage = string.Empty;
+        try
+        {
+            var workingInput = CloneListingInput(draft.Input);
+            workingInput.ItemName = ResolveValue(
+                workingInput.ItemName,
+                draft.SuggestedClassification?.SuggestedTitle);
+            workingInput.Platform = ResolveValue(
+                workingInput.Platform,
+                draft.SuggestedClassification?.BankMatchedPlatform,
+                draft.SuggestedClassification?.SuggestedPlatform);
+            workingInput.Condition = ResolveValue(
+                workingInput.Condition,
+                draft.SuggestedClassification?.SuggestedCondition,
+                "Used");
+
+            var attributes = draft.AttributeRows
+                .Where(row => !string.IsNullOrWhiteSpace(row.Key) && !string.IsNullOrWhiteSpace(row.Value))
+                .ToDictionary(
+                    row => row.Key.Trim(),
+                    row => row.Value.Trim(),
+                    StringComparer.OrdinalIgnoreCase);
+            var classification = BuildClassificationForSave(draft, workingInput, attributes);
+
+            var saved = await InventoryStore.AddItemAsync(
+                _currentUserId,
+                workingInput,
+                classification,
+                draft.SuggestedPricing);
+
+            if (draft.IsAnalyzing)
+            {
+                draft.PendingUserId = _currentUserId;
+                draft.SavedInventoryItemId = saved.Id;
+                draft.PostSaveAutofillState = CapturePostSaveAutofillState(draft.Input, draft.AttributeRows);
+                draft.Message = "Saved. Autofill will continue in background.";
+            }
+
+            _sessionAddedItems.Add(new SessionAddedItem
+            {
+                ItemName = saved.Input.ItemName,
+                Platform = saved.Input.Platform,
+                Quantity = saved.Input.Quantity,
+                Status = saved.Status,
+                AddedUtc = DateTimeOffset.UtcNow
+            });
+
+            _statusMessage = $"Added to inventory: {saved.Input.ItemName} ({saved.Status}).";
+            _errorMessage = string.Empty;
+
+            var removed = _drafts.Remove(draft);
+            if (!removed || _drafts.Count == 0)
+            {
+                AddDraft();
+            }
+
+            await PersistDraftsAsync();
+        }
+        catch (Exception ex)
+        {
+            draft.ErrorMessage = ex.Message;
+        }
+        finally
+        {
+            draft.IsSaving = false;
+        }
+    }
+
+    private static PostSaveAutofillState CapturePostSaveAutofillState(
+        ListingInput input,
+        IReadOnlyList<DraftAttributeRow> rows)
+    {
+        var lockedAttributes = rows
+            .Where(row => !string.IsNullOrWhiteSpace(row.Key) && !string.IsNullOrWhiteSpace(row.Value))
+            .Select(row => row.Key.Trim())
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        return new PostSaveAutofillState
+        {
+            ItemNameManual = !string.IsNullOrWhiteSpace(input.ItemName),
+            PlatformManual = !string.IsNullOrWhiteSpace(input.Platform),
+            ConditionManual = !string.IsNullOrWhiteSpace(input.Condition) &&
+                              !input.Condition.Trim().Equals("Used", StringComparison.OrdinalIgnoreCase),
+            PriceManual = input.UserPriceOverride.HasValue,
+            LockedAttributeKeys = lockedAttributes
+        };
+    }
+
+    private async Task<bool> ApplyAutofillToSavedItemAsync(
+        Guid userId,
+        Guid itemId,
+        ClassificationResult classification,
+        PriceSuggestionResult? pricing,
+        PostSaveAutofillState lockState)
+    {
+        if (userId == Guid.Empty)
+        {
+            return false;
+        }
+
+        var existing = await InventoryStore.GetItemAsync(userId, itemId);
+        if (existing is null)
+        {
+            return false;
+        }
+
+        var updatedInput = CloneListingInput(existing.Input);
+        if (!lockState.ItemNameManual &&
+            string.IsNullOrWhiteSpace(updatedInput.ItemName) &&
+            !string.IsNullOrWhiteSpace(classification.SuggestedTitle))
+        {
+            updatedInput.ItemName = classification.SuggestedTitle;
+        }
+
+        if (!lockState.PlatformManual && string.IsNullOrWhiteSpace(updatedInput.Platform))
+        {
+            updatedInput.Platform = ResolveValue(
+                classification.BankMatchedPlatform,
+                classification.SuggestedPlatform);
+        }
+
+        if (!lockState.ConditionManual &&
+            (string.IsNullOrWhiteSpace(updatedInput.Condition) ||
+             updatedInput.Condition.Equals("Used", StringComparison.OrdinalIgnoreCase)) &&
+            !string.IsNullOrWhiteSpace(classification.SuggestedCondition))
+        {
+            updatedInput.Condition = classification.SuggestedCondition;
+        }
+
+        if (!lockState.PriceManual &&
+            updatedInput.UserPriceOverride is null &&
+            pricing is not null &&
+            pricing.SuggestedPrice > 0)
+        {
+            updatedInput.UserPriceOverride = pricing.SuggestedPrice;
+        }
+
+        var mergedAttributes = new Dictionary<string, string>(existing.ManualSpecifics, StringComparer.OrdinalIgnoreCase);
+        foreach (var kvp in classification.ItemSpecifics)
+        {
+            if (string.IsNullOrWhiteSpace(kvp.Key) || string.IsNullOrWhiteSpace(kvp.Value))
+            {
+                continue;
+            }
+
+            var key = kvp.Key.Trim();
+            if (lockState.LockedAttributeKeys.Contains(key))
+            {
+                continue;
+            }
+
+            if (!mergedAttributes.ContainsKey(key))
+            {
+                mergedAttributes[key] = kvp.Value.Trim();
+            }
+        }
+
+        if (!lockState.LockedAttributeKeys.Contains("Platform") &&
+            !mergedAttributes.ContainsKey("Platform") &&
+            !string.IsNullOrWhiteSpace(updatedInput.Platform))
+        {
+            mergedAttributes["Platform"] = updatedInput.Platform.Trim();
+        }
+
+        return await InventoryStore.UpdateManualAttributesAsync(
+            userId,
+            itemId,
+            updatedInput,
+            mergedAttributes);
+    }
+
+    private static void MergeSuggestedAttributes(InventoryDraft draft, IReadOnlyDictionary<string, string> suggested)
+    {
+        foreach (var kvp in suggested)
+        {
+            if (string.IsNullOrWhiteSpace(kvp.Key) || string.IsNullOrWhiteSpace(kvp.Value))
+            {
+                continue;
+            }
+
+            var existing = draft.AttributeRows.FirstOrDefault(row =>
+                row.Key.Equals(kvp.Key, StringComparison.OrdinalIgnoreCase));
+            if (existing is null)
+            {
+                draft.AttributeRows.Add(new DraftAttributeRow
+                {
+                    Key = kvp.Key.Trim(),
+                    Value = kvp.Value.Trim()
+                });
+            }
+        }
+    }
+
+    private static ListingInput CloneListingInput(ListingInput input)
+    {
+        return new ListingInput
+        {
+            ItemName = input.ItemName,
+            Description = input.Description,
+            Platform = input.Platform,
+            Condition = input.Condition,
+            IsSealed = input.IsSealed,
+            Quantity = Math.Clamp(input.Quantity, 1, 20),
+            UserPriceOverride = input.UserPriceOverride,
+            Photos = input.Photos.Select(photo => new UploadedPhoto
+            {
+                FileName = photo.FileName,
+                RelativeUrl = photo.RelativeUrl,
+                ContentType = photo.ContentType,
+                SizeBytes = photo.SizeBytes
+            }).ToList()
+        };
+    }
+
+    private static ClassificationResult? BuildClassificationForSave(
+        InventoryDraft draft,
+        ListingInput input,
+        Dictionary<string, string> attributes)
+    {
+        if (draft.SuggestedClassification is null && attributes.Count == 0)
+        {
+            return null;
+        }
+
+        var suggested = draft.SuggestedClassification;
+        return new ClassificationResult
+        {
+            Source = suggested?.Source ?? "Autofill",
+            SuggestedTitle = input.ItemName,
+            SuggestedPlatform = input.Platform,
+            BankMatchedTitle = suggested?.BankMatchedTitle ?? string.Empty,
+            BankMatchedPlatform = suggested?.BankMatchedPlatform ?? string.Empty,
+            BankMatchScore = suggested?.BankMatchScore ?? 0m,
+            SuggestedCondition = input.Condition,
+            Franchise = suggested?.Franchise ?? string.Empty,
+            Edition = suggested?.Edition ?? string.Empty,
+            CategoryId = string.IsNullOrWhiteSpace(suggested?.CategoryId) ? "139973" : suggested.CategoryId,
+            Confidence = suggested?.Confidence ?? 1m,
+            ItemSpecifics = attributes
+        };
+    }
+
+    private static string GetDraftDisplayName(InventoryDraft draft)
+    {
+        return string.IsNullOrWhiteSpace(draft.Input.ItemName) ? "Unnamed item" : draft.Input.ItemName.Trim();
+    }
+
+    private static string ResolveValue(params string?[] values)
+    {
+        foreach (var value in values)
+        {
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                return value.Trim();
+            }
+        }
+
+        return string.Empty;
+    }
+
+    private static void ApplyClassificationDefaults(ListingInput input, ClassificationResult classification)
+    {
+        if (string.IsNullOrWhiteSpace(input.ItemName) &&
+            !string.IsNullOrWhiteSpace(classification.SuggestedTitle))
+        {
+            input.ItemName = classification.SuggestedTitle;
+        }
+
+        if (string.IsNullOrWhiteSpace(input.Platform))
+        {
+            if (!string.IsNullOrWhiteSpace(classification.BankMatchedPlatform))
+            {
+                input.Platform = classification.BankMatchedPlatform;
+            }
+            else if (!string.IsNullOrWhiteSpace(classification.SuggestedPlatform))
+            {
+                input.Platform = classification.SuggestedPlatform;
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(input.Condition) && !string.IsNullOrWhiteSpace(classification.SuggestedCondition))
+        {
+            input.Condition = classification.SuggestedCondition;
+        }
+    }
+
+    private static string DisplayOrFallback(string? value)
+    {
+        return string.IsNullOrWhiteSpace(value) ? "-" : value;
+    }
+
+    private void OpenImagePreview(UploadedPhoto photo)
+    {
+        _expandedImageUrl = photo.RelativeUrl;
+        _expandedImageName = photo.FileName;
+    }
+
+    private void CloseImagePreview()
+    {
+        _expandedImageUrl = null;
+        _expandedImageName = string.Empty;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        CancelAllDraftAnalyses();
+
+        if (_autosaveCts is not null)
+        {
+            try
+            {
+                _autosaveCts.Cancel();
+            }
+            catch
+            {
+                // Ignore cancellation failures during dispose.
+            }
+        }
+
+        if (_autosaveTask is not null)
+        {
+            try
+            {
+                await _autosaveTask;
+            }
+            catch
+            {
+                // Ignore autosave shutdown errors during dispose.
+            }
+        }
+
+        if (_cacheReady)
+        {
+            try
+            {
+                await PersistDraftsCoreAsync();
+            }
+            catch
+            {
+                // Ignore final persistence failures during dispose.
+            }
+        }
+
+        _autosaveCts?.Dispose();
+    }
+
+    private static void RequestDraftAnalysisCancellation(InventoryDraft draft)
+    {
+        if (draft.AnalysisCts is null)
+        {
+            return;
+        }
+
+        try
+        {
+            draft.AnalysisCts.Cancel();
+        }
+        catch
+        {
+            // Ignore cancellation failures.
+        }
+    }
+
+    private void CancelAllDraftAnalyses()
+    {
+        foreach (var draft in _drafts)
+        {
+            RequestDraftAnalysisCancellation(draft);
+        }
+    }
+
+    private async Task<bool> ConfirmAsync(string prompt)
+    {
+        try
+        {
+            return await JSRuntime.InvokeAsync<bool>("confirm", prompt);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private void StartDraftAutosave()
+    {
+        if (_autosaveTask is not null)
+        {
+            return;
+        }
+
+        _autosaveCts = new CancellationTokenSource();
+        _autosaveTask = Task.Run(() => RunDraftAutosaveAsync(_autosaveCts.Token));
+    }
+
+    private async Task RunDraftAutosaveAsync(CancellationToken cancellationToken)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(4));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(cancellationToken))
+            {
+                await InvokeAsync(PersistDraftsCoreAsync);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Normal shutdown.
+        }
+    }
+
+    private Task PersistDraftsAsync()
+    {
+        return InvokeAsync(PersistDraftsCoreAsync);
+    }
+
+    private async Task PersistDraftsCoreAsync()
+    {
+        if (!_cacheReady)
+        {
+            return;
+        }
+
+        try
+        {
+            var snapshot = new DraftCacheSnapshot
+            {
+                Drafts = _drafts.Select(ToCachedDraft).ToList(),
+                SessionAddedItems = _sessionAddedItems
+                    .OrderBy(item => item.AddedUtc)
+                    .Select(item => new SessionAddedItem
+                    {
+                        ItemName = item.ItemName,
+                        Platform = item.Platform,
+                        Quantity = item.Quantity,
+                        Status = item.Status,
+                        AddedUtc = item.AddedUtc
+                    })
+                    .ToList()
+            };
+
+            var json = JsonSerializer.Serialize(snapshot, _cacheJsonOptions);
+            await JSRuntime.InvokeVoidAsync("localStorage.setItem", DraftCacheKey, json);
+        }
+        catch
+        {
+            // Ignore local cache persistence errors.
+        }
+    }
+
+    private async Task RestoreDraftsFromCacheAsync()
+    {
+        try
+        {
+            var raw = await JSRuntime.InvokeAsync<string?>("localStorage.getItem", DraftCacheKey);
+            if (!string.IsNullOrWhiteSpace(raw))
+            {
+                var snapshot = JsonSerializer.Deserialize<DraftCacheSnapshot>(raw, _cacheJsonOptions);
+                if (snapshot is not null)
+                {
+                    _drafts.Clear();
+                    foreach (var cached in snapshot.Drafts.Take(40))
+                    {
+                        _drafts.Add(FromCachedDraft(cached));
+                    }
+
+                    if (_drafts.Count == 0)
+                    {
+                        _drafts.Add(new InventoryDraft());
+                    }
+
+                    _sessionAddedItems.Clear();
+                    foreach (var item in snapshot.SessionAddedItems.Take(200))
+                    {
+                        _sessionAddedItems.Add(new SessionAddedItem
+                        {
+                            ItemName = item.ItemName,
+                            Platform = item.Platform,
+                            Quantity = item.Quantity,
+                            Status = item.Status,
+                            AddedUtc = item.AddedUtc
+                        });
+                    }
+
+                    if (snapshot.Drafts.Count > 0)
+                    {
+                        _statusMessage = $"Recovered {snapshot.Drafts.Count} draft item(s) from local cache.";
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Ignore cache restore failures and continue with empty drafts.
+        }
+        finally
+        {
+            _cacheReady = true;
+            try
+            {
+                await PersistDraftsCoreAsync();
+            }
+            catch
+            {
+                // Ignore initial cache write failures.
+            }
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private static void ResetDraft(InventoryDraft draft)
+    {
+        draft.Input = new ListingInput
+        {
+            Condition = "Used",
+            Quantity = 1
+        };
+        draft.AttributeRows.Clear();
+        draft.SuggestedClassification = null;
+        draft.SuggestedPricing = null;
+        draft.AnalysisVersion++;
+        draft.AnalysisCts = null;
+        draft.PendingUserId = Guid.Empty;
+        draft.SavedInventoryItemId = null;
+        draft.PostSaveAutofillState = null;
+        draft.PostSaveAutofillCompleted = false;
+        draft.ShowAttributes = false;
+        draft.IsAnalyzing = false;
+        draft.IsSaving = false;
+    }
+
+    private static CachedInventoryDraft ToCachedDraft(InventoryDraft draft)
+    {
+        return new CachedInventoryDraft
+        {
+            Id = draft.Id,
+            Input = CloneListingInput(draft.Input),
+            AttributeRows = draft.AttributeRows
+                .Select(row => new DraftAttributeRow
+                {
+                    Id = row.Id,
+                    Key = row.Key,
+                    Value = row.Value
+                })
+                .ToList(),
+            ShowAttributes = draft.ShowAttributes
+        };
+    }
+
+    private static InventoryDraft FromCachedDraft(CachedInventoryDraft cached)
+    {
+        var input = cached.Input is null
+            ? new ListingInput
+            {
+                Condition = "Used",
+                Quantity = 1
+            }
+            : CloneListingInput(cached.Input);
+
+        if (string.IsNullOrWhiteSpace(input.Condition))
+        {
+            input.Condition = "Used";
+        }
+
+        input.Quantity = Math.Clamp(input.Quantity, 1, 20);
+
+        return new InventoryDraft
+        {
+            Id = cached.Id == Guid.Empty ? Guid.NewGuid() : cached.Id,
+            Input = input,
+            AttributeRows = cached.AttributeRows
+                .Select(row => new DraftAttributeRow
+                {
+                    Id = row.Id == Guid.Empty ? Guid.NewGuid() : row.Id,
+                    Key = row.Key,
+                    Value = row.Value
+                })
+                .ToList(),
+            ShowAttributes = cached.ShowAttributes
+        };
+    }
+
+    private sealed class InventoryDraft
+    {
+        public Guid Id { get; set; } = Guid.NewGuid();
+
+        public ListingInput Input { get; set; } = new()
+        {
+            Condition = "Used",
+            Quantity = 1
+        };
+
+        public List<DraftAttributeRow> AttributeRows { get; set; } = [];
+
+        public ClassificationResult? SuggestedClassification { get; set; }
+
+        public PriceSuggestionResult? SuggestedPricing { get; set; }
+
+        public int AnalysisVersion { get; set; }
+
+        public CancellationTokenSource? AnalysisCts { get; set; }
+
+        public Guid PendingUserId { get; set; }
+
+        public Guid? SavedInventoryItemId { get; set; }
+
+        public PostSaveAutofillState? PostSaveAutofillState { get; set; }
+
+        public bool PostSaveAutofillCompleted { get; set; }
+
+        public bool ShowAttributes { get; set; }
+
+        public bool IsAnalyzing { get; set; }
+
+        public bool IsSaving { get; set; }
+
+        public string Message { get; set; } = string.Empty;
+
+        public string ErrorMessage { get; set; } = string.Empty;
+    }
+
+    private sealed class DraftAttributeRow
+    {
+        public Guid Id { get; set; } = Guid.NewGuid();
+
+        public string Key { get; set; } = string.Empty;
+
+        public string Value { get; set; } = string.Empty;
+    }
+
+    private sealed class PostSaveAutofillState
+    {
+        public bool ItemNameManual { get; set; }
+
+        public bool PlatformManual { get; set; }
+
+        public bool ConditionManual { get; set; }
+
+        public bool PriceManual { get; set; }
+
+        public HashSet<string> LockedAttributeKeys { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private sealed class SessionAddedItem
+    {
+        public string ItemName { get; set; } = string.Empty;
+
+        public string Platform { get; set; } = string.Empty;
+
+        public int Quantity { get; set; }
+
+        public string Status { get; set; } = InventoryItemStatuses.Inactive;
+
+        public DateTimeOffset AddedUtc { get; set; }
+    }
+
+    private sealed class DraftCacheSnapshot
+    {
+        public List<CachedInventoryDraft> Drafts { get; set; } = [];
+
+        public List<SessionAddedItem> SessionAddedItems { get; set; } = [];
+    }
+
+    private sealed class CachedInventoryDraft
+    {
+        public Guid Id { get; set; }
+
+        public ListingInput? Input { get; set; }
+
+        public List<DraftAttributeRow> AttributeRows { get; set; } = [];
+
+        public bool ShowAttributes { get; set; }
+    }
+}

@@ -1,0 +1,70 @@
+@page "/sign-in"
+@using Microsoft.AspNetCore.Components
+
+<PageTitle>Sign In</PageTitle>
+
+<main class="page-shell">
+    <section class="panel auth-card">
+        <h1>Sign in</h1>
+        <p class="muted">Use your account email and password to continue.</p>
+
+        @if (!string.IsNullOrWhiteSpace(ErrorMessage))
+        {
+            <div class="status status-error">@ErrorMessage</div>
+        }
+
+        <form method="post" action="/account/sign-in" class="auth-form">
+            <input type="hidden" name="returnUrl" value="@ResolvedReturnUrl" />
+            <label>
+                Email
+                <input class="input" type="email" name="email" required />
+            </label>
+            <label>
+                Password
+                <input class="input" type="password" name="password" required />
+            </label>
+            <label class="checkbox-row">
+                <input type="checkbox" name="rememberMe" />
+                Keep me signed in
+            </label>
+            <div class="button-row">
+                <button type="submit" class="btn btn-primary">Sign in</button>
+                <a class="btn" href="/sign-up">Create account</a>
+            </div>
+        </form>
+    </section>
+</main>
+
+@code {
+    [SupplyParameterFromQuery(Name = "returnUrl")]
+    public string? ReturnUrl { get; set; }
+
+    [SupplyParameterFromQuery(Name = "error")]
+    public string? Error { get; set; }
+
+    private string ResolvedReturnUrl => NormalizeReturnUrl(ReturnUrl, "/app");
+
+    private string ErrorMessage => Error switch
+    {
+        "invalid_credentials" => "Email or password is incorrect.",
+        _ => string.Empty
+    };
+
+    private static string NormalizeReturnUrl(string? value, string fallback)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return fallback;
+        }
+
+        var candidate = value.Trim();
+        if (!candidate.StartsWith("/", StringComparison.Ordinal) ||
+            candidate.StartsWith("//", StringComparison.Ordinal) ||
+            candidate.StartsWith("/\\", StringComparison.Ordinal))
+        {
+            return fallback;
+        }
+
+        return candidate;
+    }
+}

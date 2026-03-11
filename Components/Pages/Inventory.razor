@@ -1,0 +1,373 @@
+@page "/inventory"
+@rendermode InteractiveServer
+@attribute [Authorize]
+@using CatalogPilot.Models
+@inject AuthenticationStateProvider AuthenticationStateProvider
+@inject IInventoryStore InventoryStore
+
+<PageTitle>Inventory</PageTitle>
+
+<main class="page-shell">
+    <header class="hero">
+        <h1>Inventory</h1>
+        <p>Step 2: review items, status, and edit manual attributes before listing.</p>
+        <p style="margin-top:0.6rem;"><a href="/inventory/add">Add inventory items</a> | <a href="/inventory/list-inactive">List inactive queue</a></p>
+    </header>
+
+    @if (!string.IsNullOrWhiteSpace(_errorMessage))
+    {
+        <div class="status status-error">@_errorMessage</div>
+    }
+    @if (!string.IsNullOrWhiteSpace(_statusMessage))
+    {
+        <div class="status status-ok">@_statusMessage</div>
+    }
+
+    <section class="panel">
+        <h2>Items</h2>
+        @if (_loading)
+        {
+            <p class="muted">Loading inventory...</p>
+        }
+        else if (_items.Count == 0)
+        {
+            <p class="muted">No inventory items yet.</p>
+        }
+        else
+        {
+            <table class="comp-table">
+                <thead>
+                    <tr>
+                        <th>Item</th>
+                        <th>Status</th>
+                        <th>Qty</th>
+                        <th>Created</th>
+                        <th>Listed</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var item in _items)
+                    {
+                        <tr class="inventory-row" @onclick="() => OpenModal(item)">
+                            <td>@DisplayOrFallback(item.Input.ItemName)</td>
+                            <td><span class="status-chip @GetStatusChipClass(item.Status)">@item.Status</span></td>
+                            <td>@item.Input.Quantity</td>
+                            <td>@item.CreatedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm")</td>
+                            <td>@(item.ListedUtc is null ? "-" : item.ListedUtc.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm"))</td>
+                            <td><span class="muted">Click row</span></td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        }
+    </section>
+</main>
+
+@if (_modalOpen && _selectedItem is not null)
+{
+    <div class="modal-overlay">
+        <section class="panel inventory-modal" role="dialog" aria-modal="true" aria-label="Inventory item details">
+            <header class="inventory-modal-head">
+                <h2>@DisplayOrFallback(_selectedItem.Input.ItemName)</h2>
+                <button type="button" class="btn" @onclick="CloseModal">Close</button>
+            </header>
+
+            @if (!string.IsNullOrWhiteSpace(_selectedItem.ListingMessage))
+            {
+                <p class="muted">@_selectedItem.ListingMessage</p>
+            }
+
+            <div class="content-grid" style="margin-top:0.8rem;">
+                <section class="panel">
+                    <h3>Suggested Attributes</h3>
+                    @if (_selectedItem.SuggestedClassification is null && _selectedItem.SuggestedPricing is null)
+                    {
+                        <p class="muted">No suggestions available.</p>
+                    }
+                    else
+                    {
+                        @if (_selectedItem.SuggestedClassification is not null)
+                        {
+                            <dl class="summary-grid">
+                                <dt>Title</dt><dd>@DisplayOrFallback(_selectedItem.SuggestedClassification.SuggestedTitle)</dd>
+                                <dt>Platform</dt><dd>@DisplayOrFallback(_selectedItem.SuggestedClassification.SuggestedPlatform)</dd>
+                                <dt>Condition</dt><dd>@DisplayOrFallback(_selectedItem.SuggestedClassification.SuggestedCondition)</dd>
+                                <dt>Category</dt><dd>@DisplayOrFallback(_selectedItem.SuggestedClassification.CategoryId)</dd>
+                                <dt>Confidence</dt><dd>@_selectedItem.SuggestedClassification.Confidence.ToString("P0")</dd>
+                            </dl>
+                        }
+                        @if (_selectedItem.SuggestedPricing is not null)
+                        {
+                            <p class="price-tag" style="margin-top:0.8rem;">@_selectedItem.SuggestedPricing.Currency @_selectedItem.SuggestedPricing.SuggestedPrice</p>
+                            <p class="muted">@_selectedItem.SuggestedPricing.Strategy</p>
+                        }
+                        @if (_selectedItem.SuggestedClassification?.ItemSpecifics.Count > 0)
+                        {
+                            <div class="specifics-wrap" style="margin-top:0.7rem;">
+                                @foreach (var kvp in _selectedItem.SuggestedClassification.ItemSpecifics)
+                                {
+                                    <span class="specific-chip">@kvp.Key: @kvp.Value</span>
+                                }
+                            </div>
+                        }
+                    }
+                </section>
+
+                <section class="panel">
+                    <h3>Manual Attributes</h3>
+                    <div class="field-grid">
+                        <label>
+                            Item Name
+                            <input class="input" @bind="_modalInput.ItemName" />
+                        </label>
+                        <label>
+                            Platform
+                            <input class="input" @bind="_modalInput.Platform" />
+                        </label>
+                        <label>
+                            Condition
+                            <select class="input" @bind="_modalInput.Condition">
+                                <option value="Used">Used</option>
+                                <option value="New">New</option>
+                                <option value="For parts or not working">For parts or not working</option>
+                            </select>
+                        </label>
+                        <label>
+                            Quantity
+                            <input class="input" type="number" min="1" max="20" @bind="_modalInput.Quantity" />
+                        </label>
+                        <label>
+                            Manual Price (USD)
+                            <input class="input" type="number" step="0.01" min="0.01" @bind="_modalInput.UserPriceOverride" />
+                        </label>
+                        <label class="checkbox-row">
+                            <input type="checkbox" @bind="_modalInput.IsSealed" />
+                            Factory sealed
+                        </label>
+                    </div>
+
+                    <label class="description-field">
+                        Description
+                        <textarea class="input text-area" @bind="_modalInput.Description"></textarea>
+                    </label>
+
+                    <div style="margin-top:0.75rem;">
+                        <h4 style="margin:0 0 0.45rem;">Manual Specifics</h4>
+                        @if (_specificRows.Count == 0)
+                        {
+                            <p class="muted">No manual specifics yet.</p>
+                        }
+                        @foreach (var row in _specificRows)
+                        {
+                            <div class="manual-specific-row">
+                                <input class="input" placeholder="Attribute" @bind="row.Key" />
+                                <input class="input" placeholder="Value" @bind="row.Value" />
+                                <button type="button" class="btn btn-danger" @onclick="() => RemoveSpecificRow(row.Id)">Remove</button>
+                            </div>
+                        }
+                        <div class="button-row" style="margin-top:0.55rem;">
+                            <button type="button" class="btn" @onclick="AddSpecificRow">Add Specific</button>
+                        </div>
+                    </div>
+
+                    <div class="button-row" style="margin-top:0.9rem;">
+                        <button type="button" class="btn btn-primary" @onclick="SaveManualAttributesAsync" disabled="@_busy">Save Manual Attributes</button>
+                    </div>
+                </section>
+            </div>
+
+            @if (_selectedItem.Input.Photos.Count > 0)
+            {
+                <section class="panel" style="margin-top:1rem;">
+                    <h3>Photos</h3>
+                    <div class="photo-grid">
+                        @foreach (var photo in _selectedItem.Input.Photos)
+                        {
+                            <figure class="photo-card">
+                                <img src="@photo.RelativeUrl" alt="@photo.FileName" />
+                                <figcaption>@photo.FileName</figcaption>
+                            </figure>
+                        }
+                    </div>
+                </section>
+            }
+        </section>
+    </div>
+}
+
+@code {
+    private readonly List<InventoryItemRecord> _items = [];
+    private readonly List<SpecificRow> _specificRows = [];
+    private ListingInput _modalInput = new();
+    private InventoryItemRecord? _selectedItem;
+    private Guid _currentUserId;
+    private bool _loading = true;
+    private bool _busy;
+    private bool _modalOpen;
+    private string _statusMessage = string.Empty;
+    private string _errorMessage = string.Empty;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadItemsAsync();
+    }
+
+    private async Task LoadItemsAsync()
+    {
+        _loading = true;
+        _errorMessage = string.Empty;
+
+        try
+        {
+            var authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
+            if (!authState.User.TryGetUserId(out _currentUserId))
+            {
+                _items.Clear();
+                _errorMessage = "Unable to resolve the signed-in user.";
+                return;
+            }
+
+            var items = await InventoryStore.GetItemsAsync(_currentUserId);
+            _items.Clear();
+            _items.AddRange(items);
+        }
+        catch (Exception ex)
+        {
+            _errorMessage = ex.Message;
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    private void OpenModal(InventoryItemRecord item)
+    {
+        _selectedItem = item;
+        _modalInput = CloneListingInput(item.Input);
+        _specificRows.Clear();
+        if (item.ManualSpecifics.Count > 0)
+        {
+            _specificRows.AddRange(item.ManualSpecifics.Select(kvp => new SpecificRow
+            {
+                Key = kvp.Key,
+                Value = kvp.Value
+            }));
+        }
+
+        _modalOpen = true;
+    }
+
+    private void CloseModal()
+    {
+        _modalOpen = false;
+        _selectedItem = null;
+        _specificRows.Clear();
+        _modalInput = new ListingInput();
+    }
+
+    private void AddSpecificRow()
+    {
+        _specificRows.Add(new SpecificRow());
+    }
+
+    private void RemoveSpecificRow(Guid id)
+    {
+        var index = _specificRows.FindIndex(row => row.Id == id);
+        if (index >= 0)
+        {
+            _specificRows.RemoveAt(index);
+        }
+    }
+
+    private async Task SaveManualAttributesAsync()
+    {
+        if (_busy || _selectedItem is null || _currentUserId == Guid.Empty)
+        {
+            return;
+        }
+
+        _busy = true;
+        _errorMessage = string.Empty;
+        try
+        {
+            var manualSpecifics = _specificRows
+                .Where(row => !string.IsNullOrWhiteSpace(row.Key) && !string.IsNullOrWhiteSpace(row.Value))
+                .ToDictionary(
+                    row => row.Key.Trim(),
+                    row => row.Value.Trim(),
+                    StringComparer.OrdinalIgnoreCase);
+
+            var saved = await InventoryStore.UpdateManualAttributesAsync(
+                _currentUserId,
+                _selectedItem.Id,
+                CloneListingInput(_modalInput),
+                manualSpecifics);
+            if (!saved)
+            {
+                _errorMessage = "Unable to save manual attributes.";
+                return;
+            }
+
+            _statusMessage = "Manual attributes saved.";
+            var selectedId = _selectedItem.Id;
+            await LoadItemsAsync();
+            _selectedItem = _items.FirstOrDefault(item => item.Id == selectedId);
+            if (_selectedItem is not null)
+            {
+                _modalInput = CloneListingInput(_selectedItem.Input);
+            }
+        }
+        catch (Exception ex)
+        {
+            _errorMessage = ex.Message;
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private static string GetStatusChipClass(string status)
+    {
+        return status.Equals(InventoryItemStatuses.Listed, StringComparison.OrdinalIgnoreCase)
+            ? "status-chip-listed"
+            : "status-chip-inactive";
+    }
+
+    private static ListingInput CloneListingInput(ListingInput input)
+    {
+        return new ListingInput
+        {
+            ItemName = input.ItemName,
+            Description = input.Description,
+            Platform = input.Platform,
+            Condition = input.Condition,
+            IsSealed = input.IsSealed,
+            Quantity = Math.Clamp(input.Quantity, 1, 20),
+            UserPriceOverride = input.UserPriceOverride,
+            Photos = input.Photos.Select(photo => new UploadedPhoto
+            {
+                FileName = photo.FileName,
+                RelativeUrl = photo.RelativeUrl,
+                ContentType = photo.ContentType,
+                SizeBytes = photo.SizeBytes
+            }).ToList()
+        };
+    }
+
+    private static string DisplayOrFallback(string? value)
+    {
+        return string.IsNullOrWhiteSpace(value) ? "-" : value;
+    }
+
+    private sealed class SpecificRow
+    {
+        public Guid Id { get; set; } = Guid.NewGuid();
+
+        public string Key { get; set; } = string.Empty;
+
+        public string Value { get; set; } = string.Empty;
+    }
+}

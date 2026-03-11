@@ -27,6 +27,7 @@ bld/
 project.lock.json
 project.fragment.lock.json
 artifacts/
+.vs/
 
 # ASP.NET Scaffolding
 ScaffoldingReadMe.txt
@@ -52,3 +53,4 @@ CodeCoverage/
 *.VisualState.xml
 TestResult.xml
 nunit-*.xml
+/Data/game-catalog.db

@@ -1,0 +1,133 @@
+@page "/account"
+@attribute [Authorize]
+@using Microsoft.AspNetCore.Components
+@inject AuthenticationStateProvider AuthenticationStateProvider
+@inject IUserAccountStore UserAccountStore
+@inject IOptions<StripeBillingOptions> StripeOptionsMonitor
+
+<PageTitle>Account</PageTitle>
+
+<main class="page-shell">
+    <header class="hero">
+        <h1>Account & Billing</h1>
+        <p>Manage your subscription, billing status, and access level.</p>
+    </header>
+
+    @if (!string.IsNullOrWhiteSpace(BillingMessage))
+    {
+        <div class="status status-ok">@BillingMessage</div>
+    }
+    @if (!string.IsNullOrWhiteSpace(BillingErrorMessage))
+    {
+        <div class="status status-error">@BillingErrorMessage</div>
+    }
+
+    @if (_loading)
+    {
+        <section class="panel">
+            <p class="muted">Loading account details...</p>
+        </section>
+    }
+    else if (_user is null)
+    {
+        <section class="panel">
+            <p class="muted">Unable to load account details.</p>
+        </section>
+    }
+    else
+    {
+        <section class="panel">
+            <h2>Profile</h2>
+            <dl class="summary-grid">
+                <dt>Name</dt><dd>@DisplayOrFallback(_user.FullName)</dd>
+                <dt>Email</dt><dd>@_user.Email</dd>
+                <dt>Created</dt><dd>@_user.CreatedUtc.ToString("u")</dd>
+            </dl>
+        </section>
+
+        <section class="panel">
+            <h2>Subscription</h2>
+            @if (_subscription is null)
+            {
+                <p class="muted">No subscription record found.</p>
+            }
+            else
+            {
+                <dl class="summary-grid">
+                    <dt>Plan</dt><dd>@DisplayOrFallback(_subscription.PlanCode)</dd>
+                    <dt>Status</dt><dd>@DisplayOrFallback(_subscription.Status)</dd>
+                    <dt>Renewal</dt><dd>@DisplayOrFallback(_subscription.CurrentPeriodEndUtc?.ToString("u"))</dd>
+                    <dt>Cancel at period end</dt><dd>@(_subscription.CancelAtPeriodEnd ? "Yes" : "No")</dd>
+                </dl>
+            }
+        </section>
+
+        <section class="panel">
+            <h2>Billing Actions</h2>
+            @if (StripeEnabled)
+            {
+                <div class="button-row">
+                    <form method="post" action="/billing/checkout">
+                        <button type="submit" class="btn btn-primary">Start or Upgrade Plan</button>
+                    </form>
+                    <form method="post" action="/billing/portal">
+                        <button type="submit" class="btn">Open Billing Portal</button>
+                    </form>
+                </div>
+                <p class="muted">Checkout and billing portal are powered by Stripe.</p>
+            }
+            else
+            {
+                <p class="muted">Stripe billing is disabled in configuration.</p>
+            }
+        </section>
+    }
+</main>
+
+@code {
+    private bool _loading = true;
+    private AppUserRecord? _user;
+    private UserSubscriptionRecord? _subscription;
+
+    [SupplyParameterFromQuery(Name = "billing")]
+    public string? Billing { get; set; }
+
+    [SupplyParameterFromQuery(Name = "billingError")]
+    public string? BillingError { get; set; }
+
+    private bool StripeEnabled => StripeOptionsMonitor.Value.Enabled;
+
+    private string BillingMessage => Billing switch
+    {
+        "success" => "Stripe checkout completed. Subscription updates may take a few seconds to reflect.",
+        "cancel" => "Checkout was canceled. No changes were made.",
+        _ => string.Empty
+    };
+
+    private string BillingErrorMessage => string.IsNullOrWhiteSpace(BillingError)
+        ? string.Empty
+        : Uri.UnescapeDataString(BillingError);
+
+    protected override async Task OnInitializedAsync()
+    {
+        var authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
+        if (!authState.User.TryGetUserId(out var userId))
+        {
+            _loading = false;
+            return;
+        }
+
+        _user = await UserAccountStore.GetByIdAsync(userId);
+        if (_user is not null)
+        {
+            _subscription = await UserAccountStore.GetOrCreateSubscriptionAsync(userId);
+        }
+
+        _loading = false;
+    }
+
+    private static string DisplayOrFallback(string? value)
+    {
+        return string.IsNullOrWhiteSpace(value) ? "-" : value;
+    }
+}

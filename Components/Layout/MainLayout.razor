@@ -1,0 +1,41 @@
+@inherits LayoutComponentBase
+@namespace CatalogPilot.Components.Layout
+
+<header class="top-nav">
+    <div class="brand-wrap">
+        <a class="brand-link" href="/">Catalog-Pilot</a>
+    </div>
+    <nav class="nav-links">
+        <a href="/app">App</a>
+        <a href="/inventory/add">Add Inventory</a>
+        <a href="/inventory">Inventory</a>
+        <a href="/inventory/list-inactive">List Inactive</a>
+        <a href="/account">Account</a>
+        <AuthorizeView Roles="Admin">
+            <Authorized>
+                <a href="/admin/catalog">Catalog</a>
+            </Authorized>
+        </AuthorizeView>
+        <AuthorizeView>
+            <Authorized>
+                <form method="post" action="/account/sign-out" class="inline-form">
+                    <button type="submit" class="nav-btn">Sign out</button>
+                </form>
+            </Authorized>
+            <NotAuthorized>
+                <a href="/sign-in">Sign in</a>
+                <a href="/sign-up">Sign up</a>
+            </NotAuthorized>
+        </AuthorizeView>
+    </nav>
+</header>
+
+<main class="layout-body">
+    @Body
+</main>
+
+<div id="blazor-error-ui" data-nosnippet>
+    An unhandled error has occurred.
+    <a href="." class="reload">Reload</a>
+    <span class="dismiss">X</span>
+</div>

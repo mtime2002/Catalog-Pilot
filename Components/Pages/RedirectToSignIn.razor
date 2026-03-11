@@ -1,0 +1,21 @@
+@inject NavigationManager NavigationManager
+@inject AuthenticationStateProvider AuthenticationStateProvider
+
+<p class="muted">Redirecting to sign in...</p>
+
+@code {
+    protected override async Task OnInitializedAsync()
+    {
+        var authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
+        if (authState.User.Identity?.IsAuthenticated == true)
+        {
+            NavigationManager.NavigateTo("/app", forceLoad: true);
+            return;
+        }
+
+        var targetPath = new Uri(NavigationManager.Uri).PathAndQuery;
+        var redirectTarget = string.IsNullOrWhiteSpace(targetPath) ? "/app" : targetPath;
+        var destination = $"/sign-in?returnUrl={Uri.EscapeDataString(redirectTarget)}";
+        NavigationManager.NavigateTo(destination, forceLoad: true);
+    }
+}

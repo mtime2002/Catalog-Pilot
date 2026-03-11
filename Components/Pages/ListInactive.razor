@@ -1,0 +1,468 @@
+@page "/inventory/list-inactive"
+@rendermode InteractiveServer
+@attribute [Authorize]
+@using CatalogPilot.Models
+@inject AuthenticationStateProvider AuthenticationStateProvider
+@inject IInventoryStore InventoryStore
+@inject IEbayListingService ListingService
+@inject IEntitlementService EntitlementService
+
+<PageTitle>List Inactive Items</PageTitle>
+
+<main class="page-shell">
+    <header class="hero">
+        <h1>List Inactive Queue</h1>
+        <p>Submit one inactive item at a time using suggested attributes, then automatically advance to the next item.</p>
+        <p style="margin-top:0.6rem;"><a href="/inventory">Back to inventory</a> | <a href="/inventory/add">Add more items</a></p>
+    </header>
+
+    @if (!string.IsNullOrWhiteSpace(_errorMessage))
+    {
+        <div class="status status-error">@_errorMessage</div>
+    }
+    @if (!string.IsNullOrWhiteSpace(_statusMessage))
+    {
+        <div class="status status-ok">@_statusMessage</div>
+    }
+
+    <section class="panel">
+        <h2>Queue Status</h2>
+        @if (_loading)
+        {
+            <p class="muted">Loading queue...</p>
+        }
+        else
+        {
+            <p><strong>Processed:</strong> @_processedCount</p>
+            <p><strong>Remaining:</strong> @_queue.Count</p>
+            @if (_entitlementLoaded)
+            {
+                <p><strong>Plan Usage:</strong> @FormatListingUsage()</p>
+            }
+        }
+    </section>
+
+    @if (!_loading && _currentItem is null)
+    {
+        <section class="panel">
+            <h2>Queue Complete</h2>
+            <p class="muted">No inactive items are waiting to be listed.</p>
+        </section>
+    }
+    else if (!_loading && _currentItem is not null)
+    {
+        <section class="panel">
+            <h2>Current Item</h2>
+            <p><strong>@DisplayOrFallback(_workInput.ItemName)</strong></p>
+            <p class="muted">Created @_currentItem.CreatedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm")</p>
+            @if (!string.IsNullOrWhiteSpace(_currentItem.ListingMessage))
+            {
+                <p class="muted">Last attempt: @_currentItem.ListingMessage</p>
+            }
+        </section>
+
+        <div class="content-grid">
+            <section class="panel">
+                <h3>Suggested Attributes</h3>
+                @if (_currentItem.SuggestedClassification is null && _currentItem.SuggestedPricing is null)
+                {
+                    <p class="muted">No suggestions available.</p>
+                }
+                else
+                {
+                    @if (_currentItem.SuggestedClassification is not null)
+                    {
+                        <dl class="summary-grid">
+                            <dt>Title</dt><dd>@DisplayOrFallback(_currentItem.SuggestedClassification.SuggestedTitle)</dd>
+                            <dt>Platform</dt><dd>@DisplayOrFallback(_currentItem.SuggestedClassification.SuggestedPlatform)</dd>
+                            <dt>Condition</dt><dd>@DisplayOrFallback(_currentItem.SuggestedClassification.SuggestedCondition)</dd>
+                            <dt>Category</dt><dd>@DisplayOrFallback(_currentItem.SuggestedClassification.CategoryId)</dd>
+                            <dt>Confidence</dt><dd>@_currentItem.SuggestedClassification.Confidence.ToString("P0")</dd>
+                        </dl>
+                    }
+                    @if (_currentItem.SuggestedPricing is not null)
+                    {
+                        <p class="price-tag" style="margin-top:0.8rem;">@_currentItem.SuggestedPricing.Currency @_currentItem.SuggestedPricing.SuggestedPrice</p>
+                        <p class="muted">@_currentItem.SuggestedPricing.Strategy</p>
+                    }
+                    @if (_currentItem.SuggestedClassification?.ItemSpecifics.Count > 0)
+                    {
+                        <div class="specifics-wrap" style="margin-top:0.7rem;">
+                            @foreach (var kvp in _currentItem.SuggestedClassification.ItemSpecifics)
+                            {
+                                <span class="specific-chip">@kvp.Key: @kvp.Value</span>
+                            }
+                        </div>
+                    }
+                }
+            </section>
+
+            <section class="panel">
+                <h3>Manual Attributes</h3>
+                <div class="field-grid">
+                    <label>
+                        Item Name
+                        <input class="input" @bind="_workInput.ItemName" />
+                    </label>
+                    <label>
+                        Platform
+                        <input class="input" @bind="_workInput.Platform" />
+                    </label>
+                    <label>
+                        Condition
+                        <select class="input" @bind="_workInput.Condition">
+                            <option value="Used">Used</option>
+                            <option value="New">New</option>
+                            <option value="For parts or not working">For parts or not working</option>
+                        </select>
+                    </label>
+                    <label>
+                        Quantity
+                        <input class="input" type="number" min="1" max="20" @bind="_workInput.Quantity" />
+                    </label>
+                    <label>
+                        Manual Price (USD)
+                        <input class="input" type="number" step="0.01" min="0.01" @bind="_workInput.UserPriceOverride" />
+                    </label>
+                    <label class="checkbox-row">
+                        <input type="checkbox" @bind="_workInput.IsSealed" />
+                        Factory sealed
+                    </label>
+                </div>
+
+                <label class="description-field">
+                    Description
+                    <textarea class="input text-area" @bind="_workInput.Description"></textarea>
+                </label>
+
+                <div style="margin-top:0.75rem;">
+                    <h4 style="margin:0 0 0.45rem;">Manual Specifics</h4>
+                    @if (_specificRows.Count == 0)
+                    {
+                        <p class="muted">No manual specifics yet.</p>
+                    }
+                    @foreach (var row in _specificRows)
+                    {
+                        <div class="manual-specific-row">
+                            <input class="input" placeholder="Attribute" @bind="row.Key" />
+                            <input class="input" placeholder="Value" @bind="row.Value" />
+                            <button type="button" class="btn btn-danger" @onclick="() => RemoveSpecificRow(row.Id)" disabled="@_busy">Remove</button>
+                        </div>
+                    }
+                    <div class="button-row" style="margin-top:0.55rem;">
+                        <button type="button" class="btn" @onclick="AddSpecificRow" disabled="@_busy">Add Specific</button>
+                    </div>
+                </div>
+            </section>
+        </div>
+
+        @if (_workInput.Photos.Count > 0)
+        {
+            <section class="panel">
+                <h3>Photos</h3>
+                <div class="photo-grid">
+                    @foreach (var photo in _workInput.Photos)
+                    {
+                        <figure class="photo-card">
+                            <img src="@photo.RelativeUrl" alt="@photo.FileName" />
+                            <figcaption>@photo.FileName</figcaption>
+                        </figure>
+                    }
+                </div>
+            </section>
+        }
+
+        <section class="panel">
+            <h3>Actions</h3>
+            <div class="button-row">
+                <button type="button" class="btn btn-primary" @onclick="SubmitAndMoveNextAsync" disabled="@_busy">Submit and Next</button>
+                <button type="button" class="btn" @onclick="SkipCurrentItem" disabled="@_busy">Skip</button>
+                <button type="button" class="btn" @onclick="ReloadQueueAsync" disabled="@_busy">Reload Queue</button>
+            </div>
+        </section>
+    }
+</main>
+
+@code {
+    private readonly List<InventoryItemRecord> _queue = [];
+    private readonly List<SpecificRow> _specificRows = [];
+    private InventoryItemRecord? _currentItem;
+    private ListingInput _workInput = new();
+    private EntitlementSnapshot _entitlement = new();
+    private Guid _currentUserId;
+    private bool _loading = true;
+    private bool _busy;
+    private bool _entitlementLoaded;
+    private int _processedCount;
+    private string _statusMessage = string.Empty;
+    private string _errorMessage = string.Empty;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await ReloadQueueAsync();
+    }
+
+    private async Task ReloadQueueAsync()
+    {
+        if (_busy)
+        {
+            return;
+        }
+
+        _loading = true;
+        _errorMessage = string.Empty;
+
+        try
+        {
+            var authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
+            if (!authState.User.TryGetUserId(out _currentUserId))
+            {
+                _queue.Clear();
+                _currentItem = null;
+                _errorMessage = "Unable to resolve the signed-in user.";
+                return;
+            }
+
+            _entitlement = await EntitlementService.GetSnapshotAsync(_currentUserId);
+            _entitlementLoaded = true;
+
+            var items = await InventoryStore.GetInactiveItemsAsync(_currentUserId);
+            _queue.Clear();
+            _queue.AddRange(items);
+            _processedCount = 0;
+            PrepareCurrentItem();
+        }
+        catch (Exception ex)
+        {
+            _errorMessage = ex.Message;
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    private async Task SubmitAndMoveNextAsync()
+    {
+        if (_busy || _currentItem is null || _currentUserId == Guid.Empty)
+        {
+            return;
+        }
+
+        _busy = true;
+        _errorMessage = string.Empty;
+        try
+        {
+            var manualSpecifics = BuildManualSpecifics();
+            var saveManual = await InventoryStore.UpdateManualAttributesAsync(
+                _currentUserId,
+                _currentItem.Id,
+                CloneListingInput(_workInput),
+                manualSpecifics);
+            if (!saveManual)
+            {
+                _errorMessage = "Unable to save manual attributes before listing.";
+                return;
+            }
+
+            var consumeResult = await EntitlementService.TryConsumeListingCreationAsync(_currentUserId);
+            _entitlement = consumeResult.Snapshot;
+            _entitlementLoaded = true;
+            if (!consumeResult.Allowed)
+            {
+                _errorMessage = consumeResult.Message;
+                return;
+            }
+
+            var listingClassification = BuildClassificationForListing(_currentItem, _workInput, manualSpecifics);
+            var listingResult = await ListingService.CreateListingAsync(
+                CloneListingInput(_workInput),
+                listingClassification,
+                _currentItem.SuggestedPricing);
+
+            await InventoryStore.RecordListingAttemptAsync(_currentUserId, _currentItem.Id, listingResult);
+            _statusMessage = listingResult.Success
+                ? $"Listed {DisplayOrFallback(_workInput.ItemName)} successfully."
+                : $"Listing not published for {DisplayOrFallback(_workInput.ItemName)}. Moved to next item.";
+
+            MoveToNextItem();
+        }
+        catch (Exception ex)
+        {
+            _errorMessage = ex.Message;
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private void SkipCurrentItem()
+    {
+        if (_busy || _currentItem is null)
+        {
+            return;
+        }
+
+        _statusMessage = $"Skipped {DisplayOrFallback(_workInput.ItemName)}.";
+        MoveToNextItem();
+    }
+
+    private void MoveToNextItem()
+    {
+        if (_queue.Count > 0)
+        {
+            _queue.RemoveAt(0);
+            _processedCount++;
+        }
+
+        PrepareCurrentItem();
+    }
+
+    private void PrepareCurrentItem()
+    {
+        _currentItem = _queue.Count == 0 ? null : _queue[0];
+        _specificRows.Clear();
+        if (_currentItem is null)
+        {
+            _workInput = new ListingInput();
+            return;
+        }
+
+        _workInput = CloneListingInput(_currentItem.Input);
+        if (string.IsNullOrWhiteSpace(_workInput.ItemName) && !string.IsNullOrWhiteSpace(_currentItem.SuggestedClassification?.SuggestedTitle))
+        {
+            _workInput.ItemName = _currentItem.SuggestedClassification.SuggestedTitle;
+        }
+
+        if (string.IsNullOrWhiteSpace(_workInput.Platform) && !string.IsNullOrWhiteSpace(_currentItem.SuggestedClassification?.SuggestedPlatform))
+        {
+            _workInput.Platform = _currentItem.SuggestedClassification.SuggestedPlatform;
+        }
+
+        if (string.IsNullOrWhiteSpace(_workInput.Condition))
+        {
+            _workInput.Condition = string.IsNullOrWhiteSpace(_currentItem.SuggestedClassification?.SuggestedCondition)
+                ? "Used"
+                : _currentItem.SuggestedClassification.SuggestedCondition;
+        }
+
+        if (_currentItem.ManualSpecifics.Count > 0)
+        {
+            _specificRows.AddRange(_currentItem.ManualSpecifics.Select(kvp => new SpecificRow
+            {
+                Key = kvp.Key,
+                Value = kvp.Value
+            }));
+        }
+        else if (_currentItem.SuggestedClassification?.ItemSpecifics.Count > 0)
+        {
+            _specificRows.AddRange(_currentItem.SuggestedClassification.ItemSpecifics.Select(kvp => new SpecificRow
+            {
+                Key = kvp.Key,
+                Value = kvp.Value
+            }));
+        }
+    }
+
+    private void AddSpecificRow()
+    {
+        _specificRows.Add(new SpecificRow());
+    }
+
+    private void RemoveSpecificRow(Guid id)
+    {
+        var index = _specificRows.FindIndex(row => row.Id == id);
+        if (index >= 0)
+        {
+            _specificRows.RemoveAt(index);
+        }
+    }
+
+    private Dictionary<string, string> BuildManualSpecifics()
+    {
+        return _specificRows
+            .Where(row => !string.IsNullOrWhiteSpace(row.Key) && !string.IsNullOrWhiteSpace(row.Value))
+            .ToDictionary(
+                row => row.Key.Trim(),
+                row => row.Value.Trim(),
+                StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static ClassificationResult BuildClassificationForListing(
+        InventoryItemRecord item,
+        ListingInput manualInput,
+        Dictionary<string, string> manualSpecifics)
+    {
+        var suggested = item.SuggestedClassification;
+        var specifics = manualSpecifics.Count > 0
+            ? manualSpecifics
+            : (suggested?.ItemSpecifics is null ? [] : new Dictionary<string, string>(suggested.ItemSpecifics, StringComparer.OrdinalIgnoreCase));
+
+        if (!specifics.ContainsKey("Platform") && !string.IsNullOrWhiteSpace(manualInput.Platform))
+        {
+            specifics["Platform"] = manualInput.Platform.Trim();
+        }
+
+        return new ClassificationResult
+        {
+            Source = suggested?.Source ?? "Manual",
+            SuggestedTitle = manualInput.ItemName ?? string.Empty,
+            SuggestedPlatform = manualInput.Platform ?? string.Empty,
+            BankMatchedTitle = suggested?.BankMatchedTitle ?? string.Empty,
+            BankMatchedPlatform = suggested?.BankMatchedPlatform ?? string.Empty,
+            BankMatchScore = suggested?.BankMatchScore ?? 0m,
+            SuggestedCondition = string.IsNullOrWhiteSpace(manualInput.Condition) ? "Used" : manualInput.Condition,
+            Franchise = suggested?.Franchise ?? string.Empty,
+            Edition = suggested?.Edition ?? string.Empty,
+            CategoryId = string.IsNullOrWhiteSpace(suggested?.CategoryId) ? "139973" : suggested.CategoryId,
+            Confidence = suggested?.Confidence ?? 1m,
+            ItemSpecifics = specifics
+        };
+    }
+
+    private string FormatListingUsage()
+    {
+        if (_entitlement.IsPaidPlan || _entitlement.MonthlyListingLimit == int.MaxValue)
+        {
+            return $"{_entitlement.MonthlyListingsUsed} used (unlimited)";
+        }
+
+        return $"{_entitlement.MonthlyListingsUsed}/{_entitlement.MonthlyListingLimit} used, {_entitlement.MonthlyListingsRemaining} remaining";
+    }
+
+    private static ListingInput CloneListingInput(ListingInput input)
+    {
+        return new ListingInput
+        {
+            ItemName = input.ItemName,
+            Description = input.Description,
+            Platform = input.Platform,
+            Condition = input.Condition,
+            IsSealed = input.IsSealed,
+            Quantity = Math.Clamp(input.Quantity, 1, 20),
+            UserPriceOverride = input.UserPriceOverride,
+            Photos = input.Photos.Select(photo => new UploadedPhoto
+            {
+                FileName = photo.FileName,
+                RelativeUrl = photo.RelativeUrl,
+                ContentType = photo.ContentType,
+                SizeBytes = photo.SizeBytes
+            }).ToList()
+        };
+    }
+
+    private static string DisplayOrFallback(string? value)
+    {
+        return string.IsNullOrWhiteSpace(value) ? "-" : value;
+    }
+
+    private sealed class SpecificRow
+    {
+        public Guid Id { get; set; } = Guid.NewGuid();
+
+        public string Key { get; set; } = string.Empty;
+
+        public string Value { get; set; } = string.Empty;
+    }
+}

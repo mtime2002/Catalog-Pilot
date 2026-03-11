@@ -1,0 +1,73 @@
+@page "/sign-up"
+@using Microsoft.AspNetCore.Components
+
+<PageTitle>Create Account</PageTitle>
+
+<main class="page-shell">
+    <section class="panel auth-card">
+        <h1>Create account</h1>
+        <p class="muted">Start with a free account, then upgrade in your billing settings.</p>
+
+        @if (!string.IsNullOrWhiteSpace(ErrorMessage))
+        {
+            <div class="status status-error">@ErrorMessage</div>
+        }
+
+        <form method="post" action="/account/register" class="auth-form">
+            <input type="hidden" name="returnUrl" value="@ResolvedReturnUrl" />
+            <label>
+                Full name (optional)
+                <input class="input" type="text" name="fullName" />
+            </label>
+            <label>
+                Email
+                <input class="input" type="email" name="email" required />
+            </label>
+            <label>
+                Password (minimum 8 characters)
+                <input class="input" type="password" name="password" minlength="8" required />
+            </label>
+            <div class="button-row">
+                <button type="submit" class="btn btn-primary">Create account</button>
+                <a class="btn" href="/sign-in">Sign in instead</a>
+            </div>
+        </form>
+    </section>
+</main>
+
+@code {
+    [SupplyParameterFromQuery(Name = "returnUrl")]
+    public string? ReturnUrl { get; set; }
+
+    [SupplyParameterFromQuery(Name = "error")]
+    public string? Error { get; set; }
+
+    private string ResolvedReturnUrl => NormalizeReturnUrl(ReturnUrl, "/account");
+
+    private string ErrorMessage => Error switch
+    {
+        "invalid_email" => "Please enter a valid email address.",
+        "weak_password" => "Password must be at least 8 characters.",
+        "email_in_use" => "That email is already registered.",
+        "registration_failed" => "Account registration failed. Please try again.",
+        _ => string.Empty
+    };
+
+    private static string NormalizeReturnUrl(string? value, string fallback)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return fallback;
+        }
+
+        var candidate = value.Trim();
+        if (!candidate.StartsWith("/", StringComparison.Ordinal) ||
+            candidate.StartsWith("//", StringComparison.Ordinal) ||
+            candidate.StartsWith("/\\", StringComparison.Ordinal))
+        {
+            return fallback;
+        }
+
+        return candidate;
+    }
+}

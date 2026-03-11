@@ -1,0 +1,395 @@
+@page "/admin/catalog"
+@rendermode InteractiveServer
+@attribute [Authorize(Roles = "Admin")]
+@using CatalogPilot.Models
+@inject IHttpClientFactory HttpClientFactory
+@inject NavigationManager NavigationManager
+
+<PageTitle>Catalog Admin</PageTitle>
+
+<main class="page-shell">
+    <header class="hero">
+        <h1>Catalog Admin</h1>
+        <p>Manage the local game catalog and curated physical-console subset.</p>
+        <p><a href="/app">Back to listing tool</a></p>
+    </header>
+
+    @if (!string.IsNullOrWhiteSpace(_errorMessage))
+    {
+        <div class="status status-error">@_errorMessage</div>
+    }
+    @if (!string.IsNullOrWhiteSpace(_statusMessage))
+    {
+        <div class="status status-ok">@_statusMessage</div>
+    }
+
+    <section class="panel">
+        <h2>Catalog Stats</h2>
+        <p><strong>Indexed titles:</strong> @_titleCount</p>
+        <p><strong>Curated titles:</strong> @_curatedTitleCount</p>
+        <button class="btn" @onclick="LoadStatsAsync" disabled="@_busy">Refresh Stats</button>
+    </section>
+
+    <section class="panel">
+        <h2>Curated Catalog</h2>
+        <div class="field-grid">
+            <label>
+                Max Titles Per Platform
+                <input class="input" type="number" min="100" max="5000" @bind="_curationMaxPerPlatform" />
+            </label>
+        </div>
+        <div class="button-row" style="margin-top:0.75rem;">
+            <button class="btn btn-primary" @onclick="RunCurationAsync" disabled="@_busy">Rebuild Curated Catalog</button>
+            <button class="btn" @onclick="LoadCuratedPlatformsAsync" disabled="@_busy">Refresh Platform Counts</button>
+        </div>
+
+        @if (_curationResult is not null)
+        {
+            <dl class="summary-grid" style="margin-top:0.75rem;">
+                <dt>Success</dt><dd>@_curationResult.Success</dd>
+                <dt>Max Per Platform</dt><dd>@_curationResult.MaxPerPlatform</dd>
+                <dt>Physical Candidates</dt><dd>@_curationResult.PhysicalCandidates</dd>
+                <dt>Eligible Candidates</dt><dd>@_curationResult.EligibleCandidates</dd>
+                <dt>Curated Titles</dt><dd>@_curationResult.CuratedTitles</dd>
+                <dt>Platforms Included</dt><dd>@_curationResult.PlatformsIncluded</dd>
+                <dt>Message</dt><dd>@_curationResult.Message</dd>
+            </dl>
+        }
+
+        @if (_curatedPlatforms.Count == 0)
+        {
+            <p class="muted" style="margin-top:0.75rem;">No curated platform stats yet.</p>
+        }
+        else
+        {
+            <table class="comp-table" style="margin-top:0.75rem;">
+                <thead>
+                    <tr>
+                        <th>Platform</th>
+                        <th>Title Count</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var row in _curatedPlatforms)
+                    {
+                        <tr>
+                            <td>@row.Platform</td>
+                            <td>@row.TitleCount</td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        }
+    </section>
+
+    <div class="content-grid">
+        <section class="panel">
+            <h2>Title Search</h2>
+            <div class="field-grid">
+                <label>
+                    Query
+                    <input class="input" @bind="_titleQuery" />
+                </label>
+                <label>
+                    Platform (optional)
+                    <input class="input" @bind="_titlePlatform" />
+                </label>
+                <label>
+                    Max Results
+                    <input class="input" type="number" min="1" max="20" @bind="_titleMax" />
+                </label>
+            </div>
+            <div class="button-row" style="margin-top:0.75rem;">
+                <button class="btn btn-primary" @onclick="SearchTitlesAsync" disabled="@_busy">Search Titles</button>
+                <button class="btn" @onclick="ClearTitleResults" disabled="@_busy">Clear</button>
+            </div>
+
+            @if (_titleResults.Count == 0)
+            {
+                <p class="muted">No title results yet.</p>
+            }
+            else
+            {
+                <table class="comp-table" style="margin-top:0.75rem;">
+                    <thead>
+                        <tr>
+                            <th>#</th>
+                            <th>Title</th>
+                            <th>Platform</th>
+                            <th>Franchise</th>
+                            <th>Score</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @for (var i = 0; i < _titleResults.Count; i++)
+                        {
+                            var match = _titleResults[i];
+                            <tr>
+                                <td>@(i + 1)</td>
+                                <td>@match.Entry.Title</td>
+                                <td>@DisplayOrFallback(match.Entry.Platform)</td>
+                                <td>@DisplayOrFallback(match.Entry.Franchise)</td>
+                                <td>@match.Score.ToString("P0")</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            }
+        </section>
+
+        <section class="panel">
+            <h2>Barcode Lookup</h2>
+            <div class="field-grid">
+                <label>
+                    Barcode
+                    <input class="input" @bind="_barcodeQuery" />
+                </label>
+                <label>
+                    Platform (optional)
+                    <input class="input" @bind="_barcodePlatform" />
+                </label>
+            </div>
+            <div class="button-row" style="margin-top:0.75rem;">
+                <button class="btn btn-primary" @onclick="LookupBarcodeAsync" disabled="@_busy">Lookup Barcode</button>
+                <button class="btn" @onclick="ClearBarcodeResult" disabled="@_busy">Clear</button>
+            </div>
+
+            @if (_barcodeMatch is null)
+            {
+                <p class="muted">No barcode result yet.</p>
+            }
+            else
+            {
+                <dl class="summary-grid" style="margin-top:0.75rem;">
+                    <dt>Barcode</dt><dd>@_barcodeMatch.Code</dd>
+                    <dt>Title</dt><dd>@_barcodeMatch.Match.Entry.Title</dd>
+                    <dt>Platform</dt><dd>@DisplayOrFallback(_barcodeMatch.Match.Entry.Platform)</dd>
+                    <dt>Franchise</dt><dd>@DisplayOrFallback(_barcodeMatch.Match.Entry.Franchise)</dd>
+                    <dt>Score</dt><dd>@_barcodeMatch.Match.Score.ToString("P0")</dd>
+                </dl>
+            }
+        </section>
+    </div>
+</main>
+
+@code {
+    private HttpClient _httpClient = default!;
+    private int _titleCount;
+    private int _curatedTitleCount;
+    private string _titleQuery = string.Empty;
+    private string _titlePlatform = string.Empty;
+    private int _titleMax = 8;
+    private string _barcodeQuery = string.Empty;
+    private string _barcodePlatform = string.Empty;
+    private CatalogBarcodeMatchResult? _barcodeMatch;
+    private List<GameTitleMatchResult> _titleResults = [];
+    private CuratedCatalogRefreshResult? _curationResult;
+    private List<CuratedPlatformSummary> _curatedPlatforms = [];
+    private int _curationMaxPerPlatform = 2000;
+    private bool _busy;
+    private string _statusMessage = string.Empty;
+    private string _errorMessage = string.Empty;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _httpClient = HttpClientFactory.CreateClient();
+        _httpClient.BaseAddress = new Uri(NavigationManager.BaseUri);
+        _httpClient.Timeout = TimeSpan.FromMinutes(30);
+        await LoadStatsAsync();
+        await LoadCuratedPlatformsAsync();
+    }
+
+    private async Task LoadStatsAsync()
+    {
+        await GuardedActionAsync(async () =>
+        {
+            await LoadStatsCoreAsync();
+            _statusMessage = $"Loaded catalog stats at {DateTime.Now:HH:mm:ss}.";
+        });
+    }
+
+    private async Task RunCurationAsync()
+    {
+        await GuardedActionAsync(async () =>
+        {
+            var max = Math.Clamp(_curationMaxPerPlatform, 100, 5000);
+            var response = await _httpClient.PostAsync($"/api/catalog/curated/rebuild?maxPerPlatform={max}", null);
+            if (!response.IsSuccessStatusCode)
+            {
+                throw new InvalidOperationException(await BuildErrorMessageAsync(response));
+            }
+
+            _curationResult = await response.Content.ReadFromJsonAsync<CuratedCatalogRefreshResult>();
+            await LoadStatsCoreAsync();
+            await LoadCuratedPlatformsCoreAsync();
+            _statusMessage = _curationResult?.Message ?? "Curated catalog rebuild completed.";
+        });
+    }
+
+    private async Task LoadCuratedPlatformsAsync()
+    {
+        await GuardedActionAsync(async () =>
+        {
+            await LoadCuratedPlatformsCoreAsync();
+            _statusMessage = "Curated platform stats refreshed.";
+        });
+    }
+
+    private async Task SearchTitlesAsync()
+    {
+        if (string.IsNullOrWhiteSpace(_titleQuery))
+        {
+            _errorMessage = "Enter a title query.";
+            return;
+        }
+
+        await GuardedActionAsync(async () =>
+        {
+            var request = $"/api/catalog/search{BuildSearchQueryString(_titleQuery, _titlePlatform, _titleMax)}";
+            var response = await _httpClient.GetAsync(request);
+            if (!response.IsSuccessStatusCode)
+            {
+                throw new InvalidOperationException(await BuildErrorMessageAsync(response));
+            }
+
+            _titleResults = (await response.Content.ReadFromJsonAsync<List<GameTitleMatchResult>>()) ?? [];
+            _statusMessage = $"Found {_titleResults.Count} title match(es).";
+        });
+    }
+
+    private async Task LookupBarcodeAsync()
+    {
+        if (string.IsNullOrWhiteSpace(_barcodeQuery))
+        {
+            _errorMessage = "Enter a barcode.";
+            return;
+        }
+
+        await GuardedActionAsync(async () =>
+        {
+            var normalizedCode = Uri.EscapeDataString(_barcodeQuery.Trim());
+            var platform = string.IsNullOrWhiteSpace(_barcodePlatform)
+                ? string.Empty
+                : $"?platform={Uri.EscapeDataString(_barcodePlatform.Trim())}";
+            var response = await _httpClient.GetAsync($"/api/catalog/barcode/{normalizedCode}{platform}");
+
+            if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+            {
+                _barcodeMatch = null;
+                _statusMessage = "No barcode match found.";
+                return;
+            }
+
+            if (!response.IsSuccessStatusCode)
+            {
+                throw new InvalidOperationException(await BuildErrorMessageAsync(response));
+            }
+
+            _barcodeMatch = await response.Content.ReadFromJsonAsync<CatalogBarcodeMatchResult>();
+            _statusMessage = _barcodeMatch is null
+                ? "No barcode match found."
+                : "Barcode match loaded.";
+        });
+    }
+
+    private async Task LoadStatsCoreAsync()
+    {
+        var response = await _httpClient.GetAsync("/api/catalog/stats");
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new InvalidOperationException(await BuildErrorMessageAsync(response));
+        }
+
+        var result = await response.Content.ReadFromJsonAsync<CatalogStatsResponse>();
+        _titleCount = result?.TitleCount ?? 0;
+        _curatedTitleCount = result?.CuratedTitleCount ?? 0;
+    }
+
+    private async Task LoadCuratedPlatformsCoreAsync()
+    {
+        var response = await _httpClient.GetAsync("/api/catalog/curated/platforms?max=100");
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new InvalidOperationException(await BuildErrorMessageAsync(response));
+        }
+
+        _curatedPlatforms = (await response.Content.ReadFromJsonAsync<List<CuratedPlatformSummary>>()) ?? [];
+    }
+
+    private static string BuildSearchQueryString(string query, string platform, int max)
+    {
+        var segments = new List<string>
+        {
+            $"q={Uri.EscapeDataString(query.Trim())}",
+            $"max={Math.Clamp(max, 1, 20)}"
+        };
+
+        if (!string.IsNullOrWhiteSpace(platform))
+        {
+            segments.Add($"platform={Uri.EscapeDataString(platform.Trim())}");
+        }
+
+        return $"?{string.Join("&", segments)}";
+    }
+
+    private static async Task<string> BuildErrorMessageAsync(HttpResponseMessage response)
+    {
+        var body = await response.Content.ReadAsStringAsync();
+        if (string.IsNullOrWhiteSpace(body))
+        {
+            return $"Catalog request failed ({(int)response.StatusCode} {response.ReasonPhrase}).";
+        }
+
+        return $"Catalog request failed ({(int)response.StatusCode}): {body}";
+    }
+
+    private void ClearTitleResults()
+    {
+        _titleResults = [];
+        _statusMessage = "Title results cleared.";
+        _errorMessage = string.Empty;
+    }
+
+    private void ClearBarcodeResult()
+    {
+        _barcodeMatch = null;
+        _statusMessage = "Barcode result cleared.";
+        _errorMessage = string.Empty;
+    }
+
+    private async Task GuardedActionAsync(Func<Task> action)
+    {
+        if (_busy)
+        {
+            return;
+        }
+
+        _busy = true;
+        _errorMessage = string.Empty;
+
+        try
+        {
+            await action();
+        }
+        catch (Exception ex)
+        {
+            _errorMessage = ex.Message;
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private static string DisplayOrFallback(string? value)
+    {
+        return string.IsNullOrWhiteSpace(value) ? "-" : value;
+    }
+
+    private sealed class CatalogStatsResponse
+    {
+        public int TitleCount { get; set; }
+
+        public int CuratedTitleCount { get; set; }
+    }
+}

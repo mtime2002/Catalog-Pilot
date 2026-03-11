@@ -1,0 +1,911 @@
+﻿@page "/app"
+@rendermode InteractiveServer
+@attribute [Authorize]
+@using System.ComponentModel.DataAnnotations
+@using CatalogPilot.Models
+@using CatalogPilot.Services
+@inject IPhotoStorageService PhotoStorageService
+@inject IVideoGameClassifierService ClassifierService
+@inject IEbayPricingService PricingService
+@inject IEbayListingService ListingService
+@inject IGameTitleBankService TitleBankService
+@inject AuthenticationStateProvider AuthenticationStateProvider
+@inject IEntitlementService EntitlementService
+
+<PageTitle>eBay Video Game Lister</PageTitle>
+
+<main class="page-shell">
+    <header class="hero">
+        <h1>eBay Video Game Lister</h1>
+        <p>Choose individual or bulk listing mode, then upload photos, classify items, and create eBay listings.</p>
+        <p style="margin-top:0.6rem;">
+            <a href="/account">Manage account</a>
+            <span> | <a href="/inventory/add">Add inventory</a></span>
+            <span> | <a href="/inventory">Inventory</a></span>
+            <span> | <a href="/inventory/list-inactive">List inactive queue</a></span>
+            <AuthorizeView Roles="Admin">
+                <Authorized>
+                    <span> | <a href="/admin/catalog">Open catalog admin</a></span>
+                </Authorized>
+            </AuthorizeView>
+        </p>
+    </header>
+
+    <section class="panel mode-panel">
+        <div class="mode-switch" role="tablist" aria-label="Listing mode">
+            <button type="button"
+                    class="@GetModeButtonClass(ListingMode.Individual)"
+                    aria-pressed="@(_listingMode == ListingMode.Individual)"
+                    @onclick="@(() => SwitchMode(ListingMode.Individual))">
+                Individual
+            </button>
+            <button type="button"
+                    class="@GetModeButtonClass(ListingMode.Bulk)"
+                    aria-pressed="@(_listingMode == ListingMode.Bulk)"
+                    @onclick="@(() => SwitchMode(ListingMode.Bulk))">
+                Bulk
+            </button>
+        </div>
+        <p class="muted mode-helper">
+            @(_listingMode == ListingMode.Individual
+                ? "Individual mode keeps the one-page workflow."
+                : "Bulk mode prompts for all image groups first, then submits them in sequence with recommended attributes.")
+        </p>
+    </section>
+
+    @if (!string.IsNullOrWhiteSpace(_errorMessage))
+    {
+        <div class="status status-error">@_errorMessage</div>
+    }
+    @if (!string.IsNullOrWhiteSpace(_statusMessage))
+    {
+        <div class="status status-ok">@_statusMessage</div>
+    }
+
+    <section class="panel">
+        <h2>Plan Usage</h2>
+        @if (!_entitlementLoaded)
+        {
+            <p class="muted">Loading plan usage...</p>
+        }
+        else
+        {
+            <dl class="summary-grid">
+                <dt>Plan</dt><dd>@DisplayOrFallback(_entitlement.PlanCode)</dd>
+                <dt>Status</dt><dd>@DisplayOrFallback(_entitlement.SubscriptionStatus)</dd>
+                <dt>Monthly Listings</dt><dd>@FormatListingUsage()</dd>
+            </dl>
+            @if (!_entitlement.CanCreateListing)
+            {
+                <p class="status status-error" style="margin-top:0.75rem;">Free plan monthly listing limit reached. Upgrade on the account page.</p>
+            }
+        }
+    </section>
+
+    @if (_listingMode == ListingMode.Individual)
+    {
+        <div class="content-grid">
+            <section class="panel">
+                <h2>1) Listing Input</h2>
+                <EditForm EditContext="_editContext">
+                    <DataAnnotationsValidator />
+                    <ValidationSummary />
+
+                    <div class="field-grid">
+                        <label>
+                            Item Name
+                            <input class="input"
+                                   value="@_input.ItemName"
+                                   @oninput="@HandleItemNameInputAsync"
+                                   autocomplete="off" />
+                        </label>
+                        <label>
+                            Platform
+                            <InputText class="input" @bind-Value="@_input.Platform" />
+                        </label>
+                        <label>
+                            Condition
+                            <InputSelect class="input" @bind-Value="@_input.Condition">
+                                <option value="Used">Used</option>
+                                <option value="New">New</option>
+                                <option value="For parts or not working">For parts or not working</option>
+                            </InputSelect>
+                        </label>
+                        <label>
+                            Quantity
+                            <InputNumber class="input" @bind-Value="@_input.Quantity" />
+                        </label>
+                        <label>
+                            Optional Manual Price (USD)
+                            <InputNumber class="input" @bind-Value="@_input.UserPriceOverride" />
+                        </label>
+                        <label class="checkbox-row">
+                            <InputCheckbox @bind-Value="@_input.IsSealed" />
+                            Factory sealed
+                        </label>
+                    </div>
+
+                    @if (_titleSuggestions.Count > 0)
+                    {
+                        <div class="suggestions">
+                            <div class="muted">External catalog suggestions</div>
+                            @foreach (var suggestion in _titleSuggestions)
+                            {
+                                <button type="button"
+                                        class="suggestion-item"
+                                        @onclick="@(() => UseTitleSuggestion(suggestion))">
+                                    <span>@suggestion.Entry.Title</span>
+                                    <small>@suggestion.Entry.Platform (@suggestion.Score:P0)</small>
+                                </button>
+                            }
+                        </div>
+                    }
+
+                    <label class="description-field">
+                        Description
+                        <InputTextArea class="input text-area" @bind-Value="@_input.Description" />
+                    </label>
+                </EditForm>
+            </section>
+
+            <section class="panel">
+                <h2>2) Photo Upload</h2>
+                <InputFile OnChange="@HandleFilesSelectedAsync" multiple accept="image/*" />
+                <p class="muted">Upload clean front/back photos of the game box for better classification and pricing.</p>
+
+                @if (_input.Photos.Count > 0)
+                {
+                    <div class="photo-grid">
+                        @foreach (var photo in _input.Photos)
+                        {
+                            <figure class="photo-card">
+                                <img src="@photo.RelativeUrl" alt="@photo.FileName" />
+                                <figcaption>@photo.FileName</figcaption>
+                            </figure>
+                        }
+                    </div>
+                }
+            </section>
+        </div>
+
+        <section class="panel action-panel">
+            <h2>3) Analyze and List</h2>
+            <div class="button-row">
+                <button type="button" class="btn" @onclick="@ClassifyAsync" disabled="@_busy">Classify Item</button>
+                <button type="button" class="btn" @onclick="@SuggestPriceAsync" disabled="@_busy">Suggest Price</button>
+                <button type="button" class="btn btn-primary" @onclick="@CreateListingAsync" disabled="@(_busy || !_entitlementLoaded || !_entitlement.CanCreateListing)">Create eBay Listing</button>
+            </div>
+        </section>
+
+        <div class="content-grid">
+            <section class="panel">
+                <h2>Classification</h2>
+                @if (_classification is null)
+                {
+                    <p class="muted">No classification yet.</p>
+                }
+                else
+                {
+                    <dl class="summary-grid">
+                        <dt>Source</dt><dd>@_classification.Source</dd>
+                        <dt>Suggested Title</dt><dd>@_classification.SuggestedTitle</dd>
+                        <dt>Platform</dt><dd>@DisplayOrFallback(_classification.SuggestedPlatform)</dd>
+                        <dt>Catalog Match</dt><dd>@DisplayOrFallback(_classification.BankMatchedTitle)</dd>
+                        <dt>Catalog Platform</dt><dd>@DisplayOrFallback(_classification.BankMatchedPlatform)</dd>
+                        <dt>Catalog Score</dt><dd>@(_classification.BankMatchScore > 0 ? $"{_classification.BankMatchScore:P0}" : "-")</dd>
+                        <dt>Franchise</dt><dd>@DisplayOrFallback(_classification.Franchise)</dd>
+                        <dt>Edition</dt><dd>@DisplayOrFallback(_classification.Edition)</dd>
+                        <dt>Condition</dt><dd>@_classification.SuggestedCondition</dd>
+                        <dt>Confidence</dt><dd>@($"{_classification.Confidence:P0}")</dd>
+                        <dt>Category</dt><dd>@_classification.CategoryId</dd>
+                        <dt>Recommended Attributes</dt>
+                        <dd>
+                            @if (_classification.ItemSpecifics.Count == 0)
+                            {
+                                <span>-</span>
+                            }
+                            else
+                            {
+                                <div class="specifics-wrap">
+                                    @foreach (var specific in _classification.ItemSpecifics)
+                                    {
+                                        <span class="specific-chip">@specific.Key: @specific.Value</span>
+                                    }
+                                </div>
+                            }
+                        </dd>
+                    </dl>
+                }
+            </section>
+
+            <section class="panel">
+                <h2>Price Suggestion</h2>
+                @if (_pricing is null)
+                {
+                    <p class="muted">No pricing suggestion yet.</p>
+                }
+                else
+                {
+                    <p class="price-tag">@_pricing.Currency @_pricing.SuggestedPrice</p>
+                    <p class="muted">@_pricing.Strategy</p>
+                    <table class="comp-table">
+                        <thead>
+                            <tr>
+                                <th>Comparable</th>
+                                <th>Listed</th>
+                                <th>Condition</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var sale in _pricing.ComparableSales.Take(8))
+                            {
+                                <tr>
+                                    <td>
+                                        @if (!string.IsNullOrWhiteSpace(sale.ListingUrl))
+                                        {
+                                            <a href="@sale.ListingUrl" target="_blank" rel="noopener noreferrer">@sale.Title</a>
+                                        }
+                                        else
+                                        {
+                                            <span>@sale.Title</span>
+                                        }
+                                    </td>
+                                    <td>@sale.Currency @(sale.SoldPrice + sale.ShippingPrice)</td>
+                                    <td>@DisplayOrFallback(sale.Condition)</td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                }
+            </section>
+        </div>
+
+        <section class="panel">
+            <h2>Listing Result</h2>
+            @if (_publishResult is null)
+            {
+                <p class="muted">No listing has been created yet.</p>
+            }
+            else
+            {
+                <p>@_publishResult.Message</p>
+                @if (!string.IsNullOrWhiteSpace(_publishResult.ListingId))
+                {
+                    <p><strong>Listing ID:</strong> @_publishResult.ListingId</p>
+                }
+                <details>
+                    <summary>Payload Preview</summary>
+                    <pre>@_publishResult.PayloadPreviewJson</pre>
+                </details>
+            }
+        </section>
+    }
+    else
+    {
+        <section class="panel">
+            <h2>1) Bulk Group Setup</h2>
+            <p class="muted">Create one image group per listing. Bulk submit processes groups in order with recommended title, platform, condition, item specifics, and pricing.</p>
+            <div class="button-row">
+                <button type="button" class="btn" @onclick="AddBulkGroup" disabled="@_busy">Add Group</button>
+            </div>
+        </section>
+
+        <section class="bulk-stack">
+            @for (var index = 0; index < _bulkDrafts.Count; index++)
+            {
+                var draft = _bulkDrafts[index];
+                <article class="panel bulk-card">
+                    <header class="bulk-card-header">
+                        <h3>Group @(index + 1)</h3>
+                        <button type="button"
+                                class="btn btn-danger"
+                                @onclick="@(() => RemoveBulkGroup(draft.Id))"
+                                disabled="@_busy || _bulkDrafts.Count == 1">
+                            Remove
+                        </button>
+                    </header>
+
+                    <div class="field-grid">
+                        <label>
+                            Label
+                            <input class="input" @bind="draft.Label" placeholder="Optional internal label" />
+                        </label>
+                        <label>
+                            Item Name (optional)
+                            <input class="input" @bind="draft.Input.ItemName" placeholder="Will be inferred from photos if blank" />
+                        </label>
+                        <label>
+                            Platform
+                            <input class="input" @bind="draft.Input.Platform" />
+                        </label>
+                        <label>
+                            Condition
+                            <select class="input" @bind="draft.Input.Condition">
+                                <option value="Used">Used</option>
+                                <option value="New">New</option>
+                                <option value="For parts or not working">For parts or not working</option>
+                            </select>
+                        </label>
+                        <label>
+                            Quantity
+                            <input class="input" type="number" min="1" max="20" @bind="draft.Input.Quantity" />
+                        </label>
+                        <label>
+                            Optional Manual Price (USD)
+                            <input class="input" type="number" step="0.01" min="0.01" @bind="draft.Input.UserPriceOverride" />
+                        </label>
+                        <label class="checkbox-row">
+                            <input type="checkbox" @bind="draft.Input.IsSealed" />
+                            Factory sealed
+                        </label>
+                    </div>
+
+                    <label class="description-field">
+                        Description
+                        <textarea class="input text-area" @bind="draft.Input.Description"></textarea>
+                    </label>
+
+                    <div class="bulk-upload-row">
+                        <InputFile OnChange="@(e => HandleBulkFilesSelectedAsync(draft, e))" multiple accept="image/*" />
+                        <span class="muted">Upload images for this group before bulk submit.</span>
+                    </div>
+
+                    @if (draft.Input.Photos.Count > 0)
+                    {
+                        <div class="photo-grid">
+                            @foreach (var photo in draft.Input.Photos)
+                            {
+                                <figure class="photo-card">
+                                    <img src="@photo.RelativeUrl" alt="@photo.FileName" />
+                                    <figcaption>@photo.FileName</figcaption>
+                                </figure>
+                            }
+                        </div>
+                    }
+
+                    @if (draft.Classification is not null)
+                    {
+                        <div class="bulk-recommend">
+                            <h4>Recommended Attributes</h4>
+                            <dl class="summary-grid">
+                                <dt>Title</dt><dd>@DisplayOrFallback(draft.Input.ItemName)</dd>
+                                <dt>Platform</dt><dd>@DisplayOrFallback(draft.Input.Platform)</dd>
+                                <dt>Condition</dt><dd>@DisplayOrFallback(draft.Input.Condition)</dd>
+                                <dt>Suggested Price</dt><dd>@(draft.Pricing is null ? "-" : $"{draft.Pricing.Currency} {draft.Pricing.SuggestedPrice}")</dd>
+                            </dl>
+                            @if (draft.Classification.ItemSpecifics.Count > 0)
+                            {
+                                <div class="specifics-wrap">
+                                    @foreach (var specific in draft.Classification.ItemSpecifics)
+                                    {
+                                        <span class="specific-chip">@specific.Key: @specific.Value</span>
+                                    }
+                                </div>
+                            }
+                        </div>
+                    }
+
+                    @if (!string.IsNullOrWhiteSpace(draft.ErrorMessage))
+                    {
+                        <div class="status status-error">@draft.ErrorMessage</div>
+                    }
+                    else if (draft.PublishResult is not null)
+                    {
+                        <div class="status @(draft.PublishResult.Success ? "status-ok" : "status-error")">
+                            @draft.PublishResult.Message
+                        </div>
+                    }
+                </article>
+            }
+        </section>
+
+        <section class="panel action-panel">
+            <h2>2) Submit Bulk Listings</h2>
+            <p class="muted">Submits groups in order and applies recommended attributes per group before listing creation.</p>
+            @if (!string.IsNullOrWhiteSpace(_bulkProgressMessage))
+            {
+                <p class="muted"><strong>@_bulkProgressMessage</strong></p>
+            }
+            <div class="button-row">
+                <button type="button" class="btn btn-primary" @onclick="SubmitBulkAsync" disabled="@(_busy || _bulkDrafts.Count == 0 || !_entitlementLoaded || !_entitlement.CanCreateListing)">
+                    Submit All Groups
+                </button>
+            </div>
+        </section>
+
+        <section class="panel">
+            <h2>Bulk Results</h2>
+            @if (!HasBulkResults())
+            {
+                <p class="muted">No bulk results yet.</p>
+            }
+            else
+            {
+                <table class="comp-table">
+                    <thead>
+                        <tr>
+                            <th>Group</th>
+                            <th>Recommended Title</th>
+                            <th>Suggested Price</th>
+                            <th>Result</th>
+                            <th>Listing ID</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @for (var index = 0; index < _bulkDrafts.Count; index++)
+                        {
+                            var draft = _bulkDrafts[index];
+                            if (draft.PublishResult is null &&
+                                draft.Classification is null &&
+                                string.IsNullOrWhiteSpace(draft.ErrorMessage))
+                            {
+                                continue;
+                            }
+
+                            <tr>
+                                <td>@GetBulkDisplayName(draft, index)</td>
+                                <td>@DisplayOrFallback(draft.Input.ItemName)</td>
+                                <td>@(draft.Pricing is null ? "-" : $"{draft.Pricing.Currency} {draft.Pricing.SuggestedPrice}")</td>
+                                <td>@GetBulkOutcome(draft)</td>
+                                <td>@(draft.PublishResult?.ListingId ?? "-")</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            }
+        </section>
+    }
+</main>
+
+@code {
+    private readonly ListingInput _input = new();
+    private readonly List<BulkListingDraft> _bulkDrafts = [];
+    private EditContext _editContext = default!;
+    private ClassificationResult? _classification;
+    private PriceSuggestionResult? _pricing;
+    private PublishListingResult? _publishResult;
+    private IReadOnlyList<GameTitleMatchResult> _titleSuggestions = [];
+    private ListingMode _listingMode = ListingMode.Individual;
+    private bool _busy;
+    private string _statusMessage = string.Empty;
+    private string _errorMessage = string.Empty;
+    private string _bulkProgressMessage = string.Empty;
+    private Guid _currentUserId;
+    private EntitlementSnapshot _entitlement = new();
+    private bool _entitlementLoaded;
+
+    protected override void OnInitialized()
+    {
+        _editContext = new EditContext(_input);
+        AddBulkGroup();
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        await RefreshEntitlementsAsync();
+    }
+
+    private string GetModeButtonClass(ListingMode mode)
+    {
+        return mode == _listingMode ? "mode-pill mode-pill-active" : "mode-pill";
+    }
+
+    private void SwitchMode(ListingMode mode)
+    {
+        _listingMode = mode;
+        _statusMessage = string.Empty;
+        _errorMessage = string.Empty;
+    }
+
+    private void AddBulkGroup()
+    {
+        _bulkDrafts.Add(new BulkListingDraft
+        {
+            Label = $"Group {_bulkDrafts.Count + 1}"
+        });
+    }
+
+    private void RemoveBulkGroup(Guid id)
+    {
+        var index = _bulkDrafts.FindIndex(draft => draft.Id == id);
+        if (index < 0)
+        {
+            return;
+        }
+
+        _bulkDrafts.RemoveAt(index);
+        if (_bulkDrafts.Count == 0)
+        {
+            AddBulkGroup();
+        }
+    }
+
+    private async Task HandleFilesSelectedAsync(InputFileChangeEventArgs e)
+    {
+        await GuardedActionAsync(async () =>
+        {
+            var files = e.GetMultipleFiles(12);
+            var uploaded = await PhotoStorageService.SaveAsync(files);
+            _input.Photos.AddRange(uploaded);
+            if (uploaded.Count > 0)
+            {
+                _classification = await ClassifierService.ClassifyAsync(_input);
+                ApplyClassificationToInput(_input, _classification, forceBankTitle: true);
+            }
+
+            await RefreshTitleSuggestionsAsync(_input.ItemName, _input.Platform);
+            _statusMessage = uploaded.Count > 0
+                ? $"Uploaded {uploaded.Count} photo(s) and refreshed title suggestions."
+                : "No photos uploaded.";
+        });
+    }
+
+    private async Task HandleBulkFilesSelectedAsync(BulkListingDraft draft, InputFileChangeEventArgs e)
+    {
+        await GuardedActionAsync(async () =>
+        {
+            var files = e.GetMultipleFiles(12);
+            var uploaded = await PhotoStorageService.SaveAsync(files);
+            draft.Input.Photos.AddRange(uploaded);
+            draft.Classification = null;
+            draft.Pricing = null;
+            draft.PublishResult = null;
+            draft.ErrorMessage = string.Empty;
+            _statusMessage = uploaded.Count > 0
+                ? $"Uploaded {uploaded.Count} photo(s) to {GetBulkDisplayName(draft, _bulkDrafts.IndexOf(draft))}."
+                : "No photos uploaded.";
+        });
+    }
+
+    private async Task ClassifyAsync()
+    {
+        if (!_editContext.Validate())
+        {
+            return;
+        }
+
+        await GuardedActionAsync(async () =>
+        {
+            _classification = await ClassifierService.ClassifyAsync(_input);
+            ApplyClassificationToInput(_input, _classification, forceBankTitle: true);
+            await RefreshTitleSuggestionsAsync(_input.ItemName, _input.Platform);
+            _statusMessage = "Classification complete.";
+        });
+    }
+
+    private async Task SuggestPriceAsync()
+    {
+        if (!_editContext.Validate())
+        {
+            return;
+        }
+
+        await GuardedActionAsync(async () =>
+        {
+            _classification ??= await ClassifierService.ClassifyAsync(_input);
+            ApplyClassificationToInput(_input, _classification, forceBankTitle: true);
+            await RefreshTitleSuggestionsAsync(_input.ItemName, _input.Platform);
+            _pricing = await PricingService.SuggestPriceAsync(_input, _classification);
+            _statusMessage = "Price suggestion updated.";
+        });
+    }
+
+    private async Task CreateListingAsync()
+    {
+        if (!_editContext.Validate())
+        {
+            return;
+        }
+
+        await GuardedActionAsync(async () =>
+        {
+            var consumeResult = await TryConsumeListingSlotAsync();
+            if (!consumeResult.Allowed)
+            {
+                _errorMessage = consumeResult.Message;
+                return;
+            }
+
+            _publishResult = await ListingService.CreateListingAsync(_input, _classification, _pricing);
+            _statusMessage = _publishResult.Success
+                ? $"Listing published. {FormatRemainingSuffix()}"
+                : $"Listing draft prepared. {FormatRemainingSuffix()}";
+        });
+    }
+
+    private async Task SubmitBulkAsync()
+    {
+        if (_bulkDrafts.Count == 0)
+        {
+            _errorMessage = "Add at least one group before submitting bulk listings.";
+            return;
+        }
+
+        await GuardedActionAsync(async () =>
+        {
+            var total = _bulkDrafts.Count;
+            var successCount = 0;
+            var failureCount = 0;
+            _bulkProgressMessage = $"Starting bulk submission for {total} group(s)...";
+
+            for (var index = 0; index < total; index++)
+            {
+                var draft = _bulkDrafts[index];
+                _bulkProgressMessage = $"Processing {GetBulkDisplayName(draft, index)} ({index + 1}/{total})...";
+                draft.ErrorMessage = string.Empty;
+                draft.Classification = null;
+                draft.Pricing = null;
+                draft.PublishResult = null;
+                StateHasChanged();
+
+                try
+                {
+                    if (draft.Input.Photos.Count == 0)
+                    {
+                        draft.ErrorMessage = "Skipped: upload at least one photo in this group.";
+                        failureCount++;
+                        continue;
+                    }
+
+                    draft.Classification = await ClassifierService.ClassifyAsync(draft.Input);
+                    ApplyClassificationToInput(draft.Input, draft.Classification, forceBankTitle: true);
+                    draft.Pricing = await PricingService.SuggestPriceAsync(draft.Input, draft.Classification);
+
+                    var consumeResult = await TryConsumeListingSlotAsync();
+                    if (!consumeResult.Allowed)
+                    {
+                        draft.ErrorMessage = consumeResult.Message;
+                        failureCount++;
+                        continue;
+                    }
+
+                    draft.PublishResult = await ListingService.CreateListingAsync(draft.Input, draft.Classification, draft.Pricing);
+
+                    if (draft.PublishResult.Success)
+                    {
+                        successCount++;
+                    }
+                    else
+                    {
+                        failureCount++;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    draft.ErrorMessage = ex.Message;
+                    failureCount++;
+                }
+            }
+
+            _bulkProgressMessage = string.Empty;
+            _statusMessage = $"Bulk submission complete. {successCount} succeeded, {failureCount} not published. {FormatRemainingSuffix()}";
+        });
+    }
+
+    private async Task RefreshEntitlementsAsync()
+    {
+        var authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
+        if (!authState.User.TryGetUserId(out _currentUserId))
+        {
+            _entitlement = new EntitlementSnapshot
+            {
+                PlanCode = "free",
+                SubscriptionStatus = "inactive",
+                MonthlyListingLimit = 0,
+                MonthlyListingsUsed = 0,
+                MonthlyListingsRemaining = 0,
+                CanCreateListing = false
+            };
+            _entitlementLoaded = true;
+            return;
+        }
+
+        _entitlement = await EntitlementService.GetSnapshotAsync(_currentUserId);
+        _entitlementLoaded = true;
+    }
+
+    private async Task<EntitlementConsumeResult> TryConsumeListingSlotAsync()
+    {
+        if (!_entitlementLoaded)
+        {
+            await RefreshEntitlementsAsync();
+        }
+
+        if (_currentUserId == Guid.Empty)
+        {
+            return new EntitlementConsumeResult
+            {
+                Allowed = false,
+                Message = "Unable to resolve the signed-in user.",
+                Snapshot = _entitlement
+            };
+        }
+
+        var consumeResult = await EntitlementService.TryConsumeListingCreationAsync(_currentUserId);
+        _entitlement = consumeResult.Snapshot;
+        return consumeResult;
+    }
+
+    private string FormatListingUsage()
+    {
+        if (!_entitlementLoaded)
+        {
+            return "-";
+        }
+
+        if (_entitlement.IsPaidPlan || _entitlement.MonthlyListingLimit == int.MaxValue)
+        {
+            return $"{_entitlement.MonthlyListingsUsed} used (unlimited)";
+        }
+
+        return $"{_entitlement.MonthlyListingsUsed}/{_entitlement.MonthlyListingLimit} used, {_entitlement.MonthlyListingsRemaining} remaining";
+    }
+
+    private string FormatRemainingSuffix()
+    {
+        return _entitlement.IsPaidPlan || _entitlement.MonthlyListingLimit == int.MaxValue
+            ? "Plan: unlimited listings."
+            : $"{_entitlement.MonthlyListingsRemaining} listing slot(s) remaining this month.";
+    }
+
+    private async Task GuardedActionAsync(Func<Task> action)
+    {
+        if (_busy)
+        {
+            return;
+        }
+
+        _busy = true;
+        _errorMessage = string.Empty;
+
+        try
+        {
+            await action();
+        }
+        catch (Exception ex)
+        {
+            _errorMessage = ex.Message;
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private static string DisplayOrFallback(string value)
+    {
+        return string.IsNullOrWhiteSpace(value) ? "-" : value;
+    }
+
+    private async Task HandleItemNameInputAsync(ChangeEventArgs e)
+    {
+        _input.ItemName = e.Value?.ToString() ?? string.Empty;
+        _editContext.NotifyFieldChanged(new FieldIdentifier(_input, nameof(ListingInput.ItemName)));
+        await RefreshTitleSuggestionsAsync(_input.ItemName, _input.Platform);
+    }
+
+    private async Task RefreshTitleSuggestionsAsync(string query, string platform)
+    {
+        if (string.IsNullOrWhiteSpace(query) || query.Length < 2)
+        {
+            _titleSuggestions = [];
+            return;
+        }
+
+        _titleSuggestions = await TitleBankService.SearchAsync(query, platform, 6);
+    }
+
+    private void UseTitleSuggestion(GameTitleMatchResult suggestion)
+    {
+        _input.ItemName = suggestion.Entry.Title;
+        if (string.IsNullOrWhiteSpace(_input.Platform))
+        {
+            _input.Platform = suggestion.Entry.Platform;
+        }
+
+        _titleSuggestions = [];
+        _editContext.NotifyFieldChanged(new FieldIdentifier(_input, nameof(ListingInput.ItemName)));
+    }
+
+    private static string GetBulkDisplayName(BulkListingDraft draft, int index)
+    {
+        return string.IsNullOrWhiteSpace(draft.Label) ? $"Group {index + 1}" : draft.Label;
+    }
+
+    private static string GetBulkOutcome(BulkListingDraft draft)
+    {
+        if (!string.IsNullOrWhiteSpace(draft.ErrorMessage))
+        {
+            return draft.ErrorMessage;
+        }
+
+        if (draft.PublishResult is null)
+        {
+            return "-";
+        }
+
+        return draft.PublishResult.Success ? "Published" : draft.PublishResult.Message;
+    }
+
+    private bool HasBulkResults()
+    {
+        return _bulkDrafts.Exists(draft =>
+            draft.PublishResult is not null ||
+            draft.Classification is not null ||
+            !string.IsNullOrWhiteSpace(draft.ErrorMessage));
+    }
+
+    private void ApplyClassificationToInput(ListingInput input, ClassificationResult classification, bool forceBankTitle = false)
+    {
+        var bankTitle = classification.BankMatchedTitle;
+        if (forceBankTitle && !string.IsNullOrWhiteSpace(bankTitle))
+        {
+            input.ItemName = bankTitle;
+        }
+        else if (string.IsNullOrWhiteSpace(input.ItemName) ||
+                 LooksLikeNoisyTitle(input.ItemName))
+        {
+            input.ItemName = classification.SuggestedTitle;
+        }
+
+        if (string.IsNullOrWhiteSpace(input.Platform) && !string.IsNullOrWhiteSpace(classification.BankMatchedPlatform))
+        {
+            input.Platform = classification.BankMatchedPlatform;
+        }
+        else if (string.IsNullOrWhiteSpace(input.Platform) && !string.IsNullOrWhiteSpace(classification.SuggestedPlatform))
+        {
+            input.Platform = classification.SuggestedPlatform;
+        }
+
+        if (string.IsNullOrWhiteSpace(input.Condition) && !string.IsNullOrWhiteSpace(classification.SuggestedCondition))
+        {
+            input.Condition = classification.SuggestedCondition;
+        }
+    }
+
+    private static bool LooksLikeNoisyTitle(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        var normalized = value.Trim().ToLowerInvariant();
+        if (normalized.Contains("playstation-network", StringComparison.Ordinal) ||
+            normalized.Contains("only on playstation", StringComparison.Ordinal) ||
+            normalized.Contains("online interactions", StringComparison.Ordinal) ||
+            normalized.Contains("not rated", StringComparison.Ordinal) ||
+            normalized.Contains("raned by", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        var tokens = normalized
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (tokens.Length < 7)
+        {
+            return false;
+        }
+
+        var shortOrNumeric = tokens.Count(token => token.Length <= 3 || token.All(char.IsDigit));
+        return shortOrNumeric / (double)tokens.Length >= 0.55;
+    }
+
+    private enum ListingMode
+    {
+        Individual,
+        Bulk
+    }
+
+    private sealed class BulkListingDraft
+    {
+        public Guid Id { get; } = Guid.NewGuid();
+        public string Label { get; set; } = string.Empty;
+        public ListingInput Input { get; } = new();
+        public ClassificationResult? Classification { get; set; }
+        public PriceSuggestionResult? Pricing { get; set; }
+        public PublishListingResult? PublishResult { get; set; }
+        public string ErrorMessage { get; set; } = string.Empty;
+    }
+}
+
