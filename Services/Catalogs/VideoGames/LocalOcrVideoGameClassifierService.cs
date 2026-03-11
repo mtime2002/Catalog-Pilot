@@ -146,7 +146,12 @@ public sealed partial class LocalOcrVideoGameClassifierService : IVideoGameClass
             return fallback;
         }
 
-        var ocrText = await ExtractOcrTextAsync(input, cancellationToken);
+        var ocrSignals = await ExtractOcrSignalsAsync(input, cancellationToken);
+        var ocrText = string.Join(
+            Environment.NewLine,
+            ocrSignals
+                .Select(signal => signal.Text)
+                .Where(text => !string.IsNullOrWhiteSpace(text)));
         if (string.IsNullOrWhiteSpace(ocrText))
         {
             return new ClassificationResult
@@ -168,16 +173,24 @@ public sealed partial class LocalOcrVideoGameClassifierService : IVideoGameClass
 
         var titleFromOcr = InferTitleFromOcr(ocrText, string.Empty, string.Empty);
         var platformFromOcr = InferPlatformFromOcr(ocrText, fallback.SuggestedPlatform, input.Platform);
-        var bankSeed = BuildBankSeed(titleFromOcr, ocrText);
-        var bankCandidates = string.IsNullOrWhiteSpace(bankSeed)
-            ? []
-            : await _titleBankService.SearchAsync(bankSeed, platformFromOcr, 3, cancellationToken);
-        var bankMatch = bankCandidates.FirstOrDefault();
-        var bankThreshold = !string.IsNullOrWhiteSpace(platformFromOcr) ? 0.16m : 0.24m;
-        var useBankTitle = bankMatch is not null && bankMatch.Score >= bankThreshold;
-        var title = useBankTitle ? bankMatch!.Entry.Title : string.Empty;
-        var platform = useBankTitle && !string.IsNullOrWhiteSpace(bankMatch!.Entry.Platform)
-            ? bankMatch.Entry.Platform
+        var bankSelection = await ResolveBestBankMatchAsync(
+            ocrSignals,
+            ocrText,
+            titleFromOcr,
+            platformFromOcr,
+            cancellationToken);
+        var bankMatch = bankSelection?.Match;
+        var bankMatchedTitle = bankMatch?.Entry.Title ?? string.Empty;
+        var bankMatchedPlatform = bankMatch?.Entry.Platform ?? string.Empty;
+        var bankMatchScore = bankMatch?.Score ?? 0m;
+        var bankConfidence = bankSelection?.Confidence ?? 0m;
+        var bankThreshold = !string.IsNullOrWhiteSpace(platformFromOcr) ? 0.22m : 0.30m;
+        var useBankTitle = bankSelection is not null &&
+                           bankConfidence >= bankThreshold &&
+                           !string.IsNullOrWhiteSpace(bankMatchedTitle);
+        var title = useBankTitle ? bankMatchedTitle : string.Empty;
+        var platform = useBankTitle && !string.IsNullOrWhiteSpace(bankMatchedPlatform)
+            ? bankMatchedPlatform
             : platformFromOcr;
         var condition = InferConditionFromOcr(ocrText, fallback.SuggestedCondition);
 
@@ -185,6 +198,19 @@ public sealed partial class LocalOcrVideoGameClassifierService : IVideoGameClass
         if (!string.IsNullOrWhiteSpace(platform))
         {
             specifics["Platform"] = platform;
+        }
+        if (!string.IsNullOrWhiteSpace(titleFromOcr) && !LooksLikeNoisyListingText(titleFromOcr))
+        {
+            specifics["OCR Candidate Title"] = titleFromOcr;
+        }
+        if (!string.IsNullOrWhiteSpace(bankMatchedTitle))
+        {
+            specifics["Bank Candidate Title"] = bankMatchedTitle;
+        }
+        if (bankSelection is not null && !string.IsNullOrWhiteSpace(bankSelection.Seed))
+        {
+            specifics["OCR Bank Seed"] = bankSelection.Seed;
+            specifics["OCR Bank Confidence"] = bankSelection.Confidence.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture);
         }
 
         var confidenceBoost = 0m;
@@ -199,16 +225,16 @@ public sealed partial class LocalOcrVideoGameClassifierService : IVideoGameClass
         }
 
         var source = useBankTitle
-            ? "PaddleOCR + External Catalog + Rule-based"
-            : "PaddleOCR + External Catalog (low confidence title match) + Rule-based";
+            ? "PaddleOCR + Per-image Catalog Match + Rule-based"
+            : "PaddleOCR + Per-image Catalog Match (low confidence title match) + Rule-based";
         return new ClassificationResult
         {
             Source = source,
             SuggestedTitle = title,
             SuggestedPlatform = string.IsNullOrWhiteSpace(platform) ? fallback.SuggestedPlatform : platform,
-            BankMatchedTitle = useBankTitle ? bankMatch?.Entry.Title ?? string.Empty : string.Empty,
-            BankMatchedPlatform = useBankTitle ? bankMatch?.Entry.Platform ?? string.Empty : string.Empty,
-            BankMatchScore = useBankTitle ? bankMatch?.Score ?? 0m : 0m,
+            BankMatchedTitle = bankMatchedTitle,
+            BankMatchedPlatform = bankMatchedPlatform,
+            BankMatchScore = bankMatchScore,
             SuggestedCondition = condition,
             Franchise = fallback.Franchise,
             Edition = fallback.Edition,
@@ -218,7 +244,7 @@ public sealed partial class LocalOcrVideoGameClassifierService : IVideoGameClass
         };
     }
 
-    private async Task<string> ExtractOcrTextAsync(ListingInput input, CancellationToken cancellationToken)
+    private async Task<List<OcrTextSignal>> ExtractOcrSignalsAsync(ListingInput input, CancellationToken cancellationToken)
     {
         var maxImages = Math.Clamp(Math.Min(_options.MaxImages, 2), 1, 3);
         var bundles = new List<ImageVariantBundle>(maxImages);
@@ -243,18 +269,19 @@ public sealed partial class LocalOcrVideoGameClassifierService : IVideoGameClass
 
         if (bundles.Count == 0 || allPaths.Count == 0)
         {
-            return string.Empty;
+            return [];
         }
 
         var ocrByPath = await RunPaddleOcrBatchAsync(allPaths.ToArray(), cancellationToken);
-        var textChunks = new List<string>(bundles.Count);
+        var signals = new List<OcrTextSignal>(bundles.Count);
 
         foreach (var bundle in bundles)
         {
             var merged = MergeSignalsForBundle(bundle, ocrByPath);
             if (!string.IsNullOrWhiteSpace(merged))
             {
-                textChunks.Add(merged);
+                var ocrQuality = ScoreOcrText(merged);
+                signals.Add(new OcrTextSignal(bundle.OriginalImagePath, merged, ocrQuality));
             }
 
             CleanupTemporaryVariants(bundle.OriginalImagePath, bundle.Variants);
@@ -262,7 +289,7 @@ public sealed partial class LocalOcrVideoGameClassifierService : IVideoGameClass
             CleanupTempFile(bundle.PlatformVariantPath);
         }
 
-        return string.Join(Environment.NewLine, textChunks);
+        return signals;
     }
 
     private static IReadOnlyList<UploadedPhoto> SelectPhotosForOcr(IReadOnlyList<UploadedPhoto> photos, int maxImages)
@@ -862,6 +889,210 @@ public sealed partial class LocalOcrVideoGameClassifierService : IVideoGameClass
         }
 
         return seed;
+    }
+
+    private async Task<BankSeedSelection?> ResolveBestBankMatchAsync(
+        IReadOnlyList<OcrTextSignal> ocrSignals,
+        string mergedOcrText,
+        string mergedTitleFromOcr,
+        string platformHint,
+        CancellationToken cancellationToken)
+    {
+        var seenSeeds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var evaluations = new List<BankSeedSelection>();
+
+        foreach (var signal in ocrSignals.OrderByDescending(item => item.OcrQuality))
+        {
+            var signalTitle = InferTitleFromOcr(signal.Text, mergedTitleFromOcr, string.Empty);
+            var seed = BuildBankSeed(signalTitle, signal.Text);
+            if (string.IsNullOrWhiteSpace(seed) || !seenSeeds.Add(seed))
+            {
+                continue;
+            }
+
+            var evaluation = await EvaluateBankSeedAsync(
+                seed,
+                signalTitle,
+                signal.Text,
+                platformHint,
+                signal.OcrQuality,
+                cancellationToken);
+            if (evaluation is not null)
+            {
+                evaluations.Add(evaluation);
+            }
+        }
+
+        var mergedSeed = BuildBankSeed(mergedTitleFromOcr, mergedOcrText);
+        if (!string.IsNullOrWhiteSpace(mergedSeed) && seenSeeds.Add(mergedSeed))
+        {
+            var mergedEvaluation = await EvaluateBankSeedAsync(
+                mergedSeed,
+                mergedTitleFromOcr,
+                mergedOcrText,
+                platformHint,
+                0.6m,
+                cancellationToken);
+            if (mergedEvaluation is not null)
+            {
+                evaluations.Add(mergedEvaluation);
+            }
+        }
+
+        return evaluations
+            .OrderByDescending(item => item.Confidence)
+            .ThenByDescending(item => item.Match.Score)
+            .FirstOrDefault();
+    }
+
+    private async Task<BankSeedSelection?> EvaluateBankSeedAsync(
+        string seed,
+        string signalTitle,
+        string signalText,
+        string platformHint,
+        decimal signalQuality,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(seed))
+        {
+            return null;
+        }
+
+        var candidates = await _titleBankService.SearchAsync(seed, platformHint, 5, cancellationToken);
+        if (candidates.Count == 0)
+        {
+            return null;
+        }
+
+        BankSeedSelection? best = null;
+        foreach (var candidate in candidates)
+        {
+            var overlap = ScoreTitleOverlap(signalTitle, candidate.Entry.Title);
+            var confidence = ScoreBankCandidateConfidence(candidate, overlap, signalTitle, signalText, signalQuality);
+            var evaluation = new BankSeedSelection(seed, signalTitle, signalQuality, candidate, confidence);
+
+            if (best is null || evaluation.Confidence > best.Confidence)
+            {
+                best = evaluation;
+            }
+        }
+
+        return best;
+    }
+
+    private static decimal ScoreBankCandidateConfidence(
+        GameTitleMatchResult candidate,
+        decimal titleOverlap,
+        string signalTitle,
+        string signalText,
+        decimal signalQuality)
+    {
+        var confidence = (candidate.Score * 0.58m) + (titleOverlap * 0.28m) + (signalQuality * 0.14m);
+        if (titleOverlap >= 0.65m)
+        {
+            confidence += 0.08m;
+        }
+        else if (titleOverlap <= 0.18m)
+        {
+            confidence -= 0.12m;
+        }
+
+        if (ContainsPhrase(signalTitle, "among thieves") &&
+            !ContainsPhrase(candidate.Entry.Title, "among thieves"))
+        {
+            confidence -= 0.22m;
+        }
+
+        if (LooksLikeAddonTitle(candidate.Entry.Title) &&
+            !LooksLikeAddonContext(signalTitle, signalText))
+        {
+            confidence -= 0.18m;
+        }
+
+        if (HasNumericToken(signalTitle) && !SharesNumericToken(signalTitle, candidate.Entry.Title))
+        {
+            confidence -= 0.08m;
+        }
+
+        return decimal.Max(0m, decimal.Min(1m, confidence));
+    }
+
+    private static decimal ScoreTitleOverlap(string source, string candidate)
+    {
+        var sourceTokens = TokenizeAlphaNumeric(source);
+        var candidateTokens = TokenizeAlphaNumeric(candidate);
+        if (sourceTokens.Length == 0 || candidateTokens.Length == 0)
+        {
+            return 0m;
+        }
+
+        var overlap = sourceTokens.Count(token => candidateTokens.Contains(token, StringComparer.Ordinal));
+        return (decimal)overlap / decimal.Max(sourceTokens.Length, candidateTokens.Length);
+    }
+
+    private static string[] TokenizeAlphaNumeric(string value)
+    {
+        return value
+            .ToLowerInvariant()
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(token => new string(token.Where(char.IsLetterOrDigit).ToArray()))
+            .Where(token => token.Length >= 2)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    private static bool ContainsPhrase(string value, string phrase)
+    {
+        if (string.IsNullOrWhiteSpace(value) || string.IsNullOrWhiteSpace(phrase))
+        {
+            return false;
+        }
+
+        var normalizedValue = NormalizeWhitespace(value).ToLowerInvariant();
+        var normalizedPhrase = NormalizeWhitespace(phrase).ToLowerInvariant();
+        return normalizedValue.Contains(normalizedPhrase, StringComparison.Ordinal);
+    }
+
+    private static bool LooksLikeAddonTitle(string value)
+    {
+        var normalized = NormalizeWhitespace(value).ToLowerInvariant();
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return false;
+        }
+
+        return normalized.Contains("pack", StringComparison.Ordinal) ||
+               normalized.Contains("dlc", StringComparison.Ordinal) ||
+               normalized.Contains("expansion", StringComparison.Ordinal) ||
+               normalized.Contains("bundle", StringComparison.Ordinal) ||
+               normalized.Contains("season pass", StringComparison.Ordinal) ||
+               normalized.Contains("multiplayer", StringComparison.Ordinal);
+    }
+
+    private static bool LooksLikeAddonContext(string signalTitle, string signalText)
+    {
+        return LooksLikeAddonTitle(signalTitle) || LooksLikeAddonTitle(signalText);
+    }
+
+    private static bool HasNumericToken(string value)
+    {
+        return TokenizeAlphaNumeric(value).Any(token => token.All(char.IsDigit));
+    }
+
+    private static bool SharesNumericToken(string source, string candidate)
+    {
+        var sourceNumbers = TokenizeAlphaNumeric(source)
+            .Where(token => token.All(char.IsDigit))
+            .ToHashSet(StringComparer.Ordinal);
+        if (sourceNumbers.Count == 0)
+        {
+            return true;
+        }
+
+        var candidateNumbers = TokenizeAlphaNumeric(candidate)
+            .Where(token => token.All(char.IsDigit))
+            .ToHashSet(StringComparer.Ordinal);
+        return sourceNumbers.Overlaps(candidateNumbers);
     }
 
     private static string NormalizeSeedFragment(string value)
@@ -1645,6 +1876,18 @@ public sealed partial class LocalOcrVideoGameClassifierService : IVideoGameClass
     {
         return value.Length <= maxLength ? value : value[..maxLength];
     }
+
+    private sealed record OcrTextSignal(
+        string ImagePath,
+        string Text,
+        decimal OcrQuality);
+
+    private sealed record BankSeedSelection(
+        string Seed,
+        string SignalTitle,
+        decimal SignalQuality,
+        GameTitleMatchResult Match,
+        decimal Confidence);
 
     private sealed record ImageVariantBundle(
         string OriginalImagePath,

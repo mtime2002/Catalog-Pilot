@@ -2,8 +2,7 @@
 @rendermode InteractiveServer
 @attribute [Authorize(Roles = "Admin")]
 @using CatalogPilot.Models
-@inject IHttpClientFactory HttpClientFactory
-@inject NavigationManager NavigationManager
+@inject IGameCatalogStore CatalogStore
 
 <PageTitle>Catalog Admin</PageTitle>
 
@@ -35,7 +34,7 @@
         <div class="field-grid">
             <label>
                 Max Titles Per Platform
-                <input class="input" type="number" min="100" max="5000" @bind="_curationMaxPerPlatform" />
+                <input class="input" type="number" min="100" max="10000" @bind="_curationMaxPerPlatform" />
             </label>
         </div>
         <div class="button-row" style="margin-top:0.75rem;">
@@ -173,7 +172,6 @@
 </main>
 
 @code {
-    private HttpClient _httpClient = default!;
     private int _titleCount;
     private int _curatedTitleCount;
     private string _titleQuery = string.Empty;
@@ -185,16 +183,13 @@
     private List<GameTitleMatchResult> _titleResults = [];
     private CuratedCatalogRefreshResult? _curationResult;
     private List<CuratedPlatformSummary> _curatedPlatforms = [];
-    private int _curationMaxPerPlatform = 2000;
+    private int _curationMaxPerPlatform = 5000;
     private bool _busy;
     private string _statusMessage = string.Empty;
     private string _errorMessage = string.Empty;
 
     protected override async Task OnInitializedAsync()
     {
-        _httpClient = HttpClientFactory.CreateClient();
-        _httpClient.BaseAddress = new Uri(NavigationManager.BaseUri);
-        _httpClient.Timeout = TimeSpan.FromMinutes(30);
         await LoadStatsAsync();
         await LoadCuratedPlatformsAsync();
     }
@@ -212,14 +207,8 @@
     {
         await GuardedActionAsync(async () =>
         {
-            var max = Math.Clamp(_curationMaxPerPlatform, 100, 5000);
-            var response = await _httpClient.PostAsync($"/api/catalog/curated/rebuild?maxPerPlatform={max}", null);
-            if (!response.IsSuccessStatusCode)
-            {
-                throw new InvalidOperationException(await BuildErrorMessageAsync(response));
-            }
-
-            _curationResult = await response.Content.ReadFromJsonAsync<CuratedCatalogRefreshResult>();
+            var max = Math.Clamp(_curationMaxPerPlatform, 100, 10000);
+            _curationResult = await CatalogStore.RebuildCuratedCatalogAsync(max);
             await LoadStatsCoreAsync();
             await LoadCuratedPlatformsCoreAsync();
             _statusMessage = _curationResult?.Message ?? "Curated catalog rebuild completed.";
@@ -245,14 +234,10 @@
 
         await GuardedActionAsync(async () =>
         {
-            var request = $"/api/catalog/search{BuildSearchQueryString(_titleQuery, _titlePlatform, _titleMax)}";
-            var response = await _httpClient.GetAsync(request);
-            if (!response.IsSuccessStatusCode)
-            {
-                throw new InvalidOperationException(await BuildErrorMessageAsync(response));
-            }
-
-            _titleResults = (await response.Content.ReadFromJsonAsync<List<GameTitleMatchResult>>()) ?? [];
+            _titleResults = (await CatalogStore.SearchSimilarTitlesAsync(
+                _titleQuery,
+                string.IsNullOrWhiteSpace(_titlePlatform) ? null : _titlePlatform.Trim(),
+                Math.Clamp(_titleMax, 1, 20))).ToList();
             _statusMessage = $"Found {_titleResults.Count} title match(es).";
         });
     }
@@ -267,25 +252,9 @@
 
         await GuardedActionAsync(async () =>
         {
-            var normalizedCode = Uri.EscapeDataString(_barcodeQuery.Trim());
-            var platform = string.IsNullOrWhiteSpace(_barcodePlatform)
-                ? string.Empty
-                : $"?platform={Uri.EscapeDataString(_barcodePlatform.Trim())}";
-            var response = await _httpClient.GetAsync($"/api/catalog/barcode/{normalizedCode}{platform}");
-
-            if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
-            {
-                _barcodeMatch = null;
-                _statusMessage = "No barcode match found.";
-                return;
-            }
-
-            if (!response.IsSuccessStatusCode)
-            {
-                throw new InvalidOperationException(await BuildErrorMessageAsync(response));
-            }
-
-            _barcodeMatch = await response.Content.ReadFromJsonAsync<CatalogBarcodeMatchResult>();
+            _barcodeMatch = await CatalogStore.FindByBarcodeAsync(
+                _barcodeQuery.Trim(),
+                string.IsNullOrWhiteSpace(_barcodePlatform) ? null : _barcodePlatform.Trim());
             _statusMessage = _barcodeMatch is null
                 ? "No barcode match found."
                 : "Barcode match loaded.";
@@ -294,53 +263,13 @@
 
     private async Task LoadStatsCoreAsync()
     {
-        var response = await _httpClient.GetAsync("/api/catalog/stats");
-        if (!response.IsSuccessStatusCode)
-        {
-            throw new InvalidOperationException(await BuildErrorMessageAsync(response));
-        }
-
-        var result = await response.Content.ReadFromJsonAsync<CatalogStatsResponse>();
-        _titleCount = result?.TitleCount ?? 0;
-        _curatedTitleCount = result?.CuratedTitleCount ?? 0;
+        _titleCount = await CatalogStore.CountTitlesAsync();
+        _curatedTitleCount = await CatalogStore.CountCuratedTitlesAsync();
     }
 
     private async Task LoadCuratedPlatformsCoreAsync()
     {
-        var response = await _httpClient.GetAsync("/api/catalog/curated/platforms?max=100");
-        if (!response.IsSuccessStatusCode)
-        {
-            throw new InvalidOperationException(await BuildErrorMessageAsync(response));
-        }
-
-        _curatedPlatforms = (await response.Content.ReadFromJsonAsync<List<CuratedPlatformSummary>>()) ?? [];
-    }
-
-    private static string BuildSearchQueryString(string query, string platform, int max)
-    {
-        var segments = new List<string>
-        {
-            $"q={Uri.EscapeDataString(query.Trim())}",
-            $"max={Math.Clamp(max, 1, 20)}"
-        };
-
-        if (!string.IsNullOrWhiteSpace(platform))
-        {
-            segments.Add($"platform={Uri.EscapeDataString(platform.Trim())}");
-        }
-
-        return $"?{string.Join("&", segments)}";
-    }
-
-    private static async Task<string> BuildErrorMessageAsync(HttpResponseMessage response)
-    {
-        var body = await response.Content.ReadAsStringAsync();
-        if (string.IsNullOrWhiteSpace(body))
-        {
-            return $"Catalog request failed ({(int)response.StatusCode} {response.ReasonPhrase}).";
-        }
-
-        return $"Catalog request failed ({(int)response.StatusCode}): {body}";
+        _curatedPlatforms = (await CatalogStore.GetCuratedPlatformSummaryAsync(100)).ToList();
     }
 
     private void ClearTitleResults()
@@ -386,10 +315,4 @@
         return string.IsNullOrWhiteSpace(value) ? "-" : value;
     }
 
-    private sealed class CatalogStatsResponse
-    {
-        public int TitleCount { get; set; }
-
-        public int CuratedTitleCount { get; set; }
-    }
 }

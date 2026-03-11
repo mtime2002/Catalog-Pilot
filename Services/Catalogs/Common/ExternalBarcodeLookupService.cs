@@ -10,6 +10,8 @@ namespace CatalogPilot.Services;
 
 public sealed partial class ExternalBarcodeLookupService : IExternalBarcodeLookupService
 {
+    private const decimal TitleBankCanonicalizationMinScore = 0.56m;
+    private const decimal BarcodeLookupMinConfidence = 0.70m;
     private readonly HttpClient _httpClient;
     private readonly IGameTitleBankService _titleBankService;
     private readonly IMemoryCache _cache;
@@ -53,10 +55,51 @@ public sealed partial class ExternalBarcodeLookupService : IExternalBarcodeLooku
             return cached.Result;
         }
 
-        var result = await LookupCoreAsync(normalizedCode, platformHint, cancellationToken);
+        var candidates = await LookupCandidatesCoreAsync(normalizedCode, platformHint, 6, cancellationToken);
+        var result = candidates.FirstOrDefault(candidate => candidate.Confidence >= BarcodeLookupMinConfidence);
+        if (result is null && candidates.Count > 0)
+        {
+            _logger.LogDebug(
+                "Discarding low-confidence barcode lookup for {Code}. Top confidence={Confidence}",
+                normalizedCode,
+                candidates[0].Confidence);
+        }
+
         var ttl = TimeSpan.FromMinutes(Math.Clamp(_options.CacheMinutes, 1, 360));
         _cache.Set(cacheKey, new CachedLookupResult { Result = result }, ttl);
         return result;
+    }
+
+    public async Task<IReadOnlyList<ExternalBarcodeLookupResult>> LookupCandidatesAsync(
+        string code,
+        string? platformHint = null,
+        int maxResults = 5,
+        CancellationToken cancellationToken = default)
+    {
+        if (!_options.Enabled)
+        {
+            return [];
+        }
+
+        var normalizedCode = NormalizeCode(code);
+        if (normalizedCode.Length < 7)
+        {
+            return [];
+        }
+
+        var requestedMax = Math.Clamp(maxResults, 1, 12);
+        var normalizedPlatformHint = NormalizeText(platformHint);
+        var cacheKey = $"ext-barcode-candidates:{normalizedCode}|{normalizedPlatformHint}|{requestedMax}";
+        if (_cache.TryGetValue(cacheKey, out ExternalBarcodeLookupResult[]? cached) && cached is not null)
+        {
+            return cached;
+        }
+
+        var results = await LookupCandidatesCoreAsync(normalizedCode, platformHint, requestedMax, cancellationToken);
+        var ttl = TimeSpan.FromMinutes(Math.Clamp(_options.CacheMinutes, 1, 360));
+        var snapshot = results.ToArray();
+        _cache.Set(cacheKey, snapshot, ttl);
+        return snapshot;
     }
 
     public async Task<ExternalBarcodeLookupResult?> LookupByTitleAsync(
@@ -108,23 +151,83 @@ public sealed partial class ExternalBarcodeLookupService : IExternalBarcodeLooku
         string? platformHint,
         CancellationToken cancellationToken)
     {
-        // MobyGames has no dedicated UPC endpoint; try direct search first for completeness.
+        var candidates = await LookupCandidatesCoreAsync(normalizedCode, platformHint, 1, cancellationToken);
+        return candidates.FirstOrDefault();
+    }
+
+    private async Task<IReadOnlyList<ExternalBarcodeLookupResult>> LookupCandidatesCoreAsync(
+        string normalizedCode,
+        string? platformHint,
+        int maxResults,
+        CancellationToken cancellationToken)
+    {
+        var limit = Math.Clamp(maxResults, 1, 12);
+        var rawCandidates = new List<ExternalBarcodeLookupResult>(12);
+
+        // MobyGames has no UPC endpoint, but strict direct title lookup can sometimes rescue full-code queries.
         var mobyDirect = await TryMobyByTitleAsync(normalizedCode, platformHint, strictTitleScore: true, cancellationToken);
         if (mobyDirect is not null)
         {
-            return mobyDirect with { Code = normalizedCode, Provider = "MobyGames" };
+            rawCandidates.Add(mobyDirect with { Code = normalizedCode, Provider = "MobyGames" });
         }
 
-        var candidate = await TryUpcItemDbAsync(normalizedCode, platformHint, cancellationToken)
-            ?? await TryGoUpcAsync(normalizedCode, platformHint, cancellationToken)
-            ?? await TryEanDbAsync(normalizedCode, platformHint, cancellationToken);
-        if (candidate is null)
+        var upcItemDbCandidates = await TryUpcItemDbCandidatesAsync(
+            normalizedCode,
+            platformHint,
+            maxResults: 8,
+            cancellationToken);
+        rawCandidates.AddRange(upcItemDbCandidates);
+
+        var goUpcCandidate = await TryGoUpcAsync(normalizedCode, platformHint, cancellationToken);
+        if (goUpcCandidate is not null)
         {
-            return null;
+            rawCandidates.Add(goUpcCandidate);
         }
 
-        var enriched = await EnrichWithMobyAsync(candidate, platformHint, cancellationToken);
-        return await CanonicalizeWithTitleBankAsync(enriched, platformHint, cancellationToken);
+        var eanCandidate = await TryEanDbAsync(normalizedCode, platformHint, cancellationToken);
+        if (eanCandidate is not null)
+        {
+            rawCandidates.Add(eanCandidate);
+        }
+
+        if (rawCandidates.Count == 0)
+        {
+            return [];
+        }
+
+        var merged = new Dictionary<string, ExternalBarcodeLookupResult>(StringComparer.Ordinal);
+        foreach (var raw in rawCandidates.Take(16))
+        {
+            var enriched = await EnrichWithMobyAsync(raw, platformHint, cancellationToken);
+            var canonical = await CanonicalizeWithTitleBankAsync(enriched, platformHint, cancellationToken) ?? enriched;
+            var normalizedTitle = NormalizeText(canonical.Title);
+            if (string.IsNullOrWhiteSpace(normalizedTitle))
+            {
+                continue;
+            }
+
+            var normalizedPlatform = NormalizeText(canonical.Platform);
+            var key = $"{normalizedTitle}|{normalizedPlatform}";
+            if (!merged.TryGetValue(key, out var existing))
+            {
+                merged[key] = canonical with { Code = normalizedCode };
+                continue;
+            }
+
+            if (canonical.Confidence > existing.Confidence)
+            {
+                merged[key] = MergeProviderInfo(canonical with { Code = normalizedCode }, existing);
+                continue;
+            }
+
+            merged[key] = MergeProviderInfo(existing, canonical);
+        }
+
+        return merged.Values
+            .OrderByDescending(candidate => candidate.Confidence)
+            .ThenBy(candidate => candidate.Title, StringComparer.OrdinalIgnoreCase)
+            .Take(limit)
+            .ToArray();
     }
 
     private async Task<ExternalBarcodeLookupResult?> TryUpcItemDbAsync(
@@ -132,22 +235,36 @@ public sealed partial class ExternalBarcodeLookupService : IExternalBarcodeLooku
         string? platformHint,
         CancellationToken cancellationToken)
     {
+        var candidates = await TryUpcItemDbCandidatesAsync(
+            normalizedCode,
+            platformHint,
+            maxResults: 1,
+            cancellationToken);
+        return candidates.FirstOrDefault();
+    }
+
+    private async Task<IReadOnlyList<ExternalBarcodeLookupResult>> TryUpcItemDbCandidatesAsync(
+        string normalizedCode,
+        string? platformHint,
+        int maxResults,
+        CancellationToken cancellationToken)
+    {
         if (!_options.UpcItemDb.Enabled)
         {
-            return null;
+            return [];
         }
 
         var baseUrl = _options.UpcItemDb.ApiBaseUrl.TrimEnd('/');
         if (string.IsNullOrWhiteSpace(baseUrl))
         {
-            return null;
+            return [];
         }
 
         var userKey = _options.UpcItemDb.UserKey.Trim();
         var useTrial = string.IsNullOrWhiteSpace(userKey) && _options.UpcItemDb.UseTrialWithoutKey;
         if (!useTrial && string.IsNullOrWhiteSpace(userKey))
         {
-            return null;
+            return [];
         }
 
         var endpoint = useTrial
@@ -167,16 +284,18 @@ public sealed partial class ExternalBarcodeLookupService : IExternalBarcodeLooku
             using var response = await SendAsync(request, cancellationToken);
             if (!response.IsSuccessStatusCode)
             {
-                return null;
+                return [];
             }
 
             var body = await response.Content.ReadAsStringAsync(cancellationToken);
             using var doc = JsonDocument.Parse(body);
             if (!doc.RootElement.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array)
             {
-                return null;
+                return [];
             }
 
+            var candidates = new List<ExternalBarcodeLookupResult>();
+            var normalizedHint = NormalizeText(platformHint);
             foreach (var item in items.EnumerateArray())
             {
                 var title = NormalizeWhitespace(GetString(item, "title"));
@@ -192,24 +311,66 @@ public sealed partial class ExternalBarcodeLookupService : IExternalBarcodeLooku
                     continue;
                 }
 
-                return new ExternalBarcodeLookupResult
+                var inferredPlatform = InferPlatform(title, category, platformHint);
+                var titleBankMatch = await _titleBankService.FindBestMatchAsync(
+                    title,
+                    string.IsNullOrWhiteSpace(inferredPlatform) ? platformHint : inferredPlatform,
+                    cancellationToken);
+                var titleBankScore = titleBankMatch?.Score ?? 0m;
+
+                var confidence = ScoreUpcItemDbCandidate(
+                    title,
+                    category,
+                    inferredPlatform,
+                    normalizedHint,
+                    titleBankScore);
+                if (confidence < 0.52m)
+                {
+                    continue;
+                }
+
+                var canonicalTitle = title;
+                var canonicalPlatform = inferredPlatform;
+                var franchise = string.Empty;
+                if (titleBankMatch is not null &&
+                    titleBankMatch.Score >= 0.64m &&
+                    !HasConflictingNumericTokens(title, titleBankMatch.Entry.Title))
+                {
+                    canonicalTitle = titleBankMatch.Entry.Title;
+                    if (!string.IsNullOrWhiteSpace(titleBankMatch.Entry.Platform))
+                    {
+                        canonicalPlatform = titleBankMatch.Entry.Platform;
+                    }
+
+                    franchise = titleBankMatch.Entry.Franchise;
+                    confidence = decimal.Min(0.92m, confidence + (titleBankMatch.Score * 0.08m));
+                }
+
+                var candidate = new ExternalBarcodeLookupResult
                 {
                     Code = normalizedCode,
-                    Title = title,
-                    Platform = InferPlatform(title, category, platformHint),
+                    Title = canonicalTitle,
+                    Platform = canonicalPlatform,
+                    Franchise = franchise,
                     Provider = "UPCitemdb",
                     Brand = brand,
                     Category = category,
-                    Confidence = 0.64m
+                    Confidence = confidence
                 };
+
+                candidates.Add(candidate);
             }
 
-            return null;
+            return candidates
+                .OrderByDescending(candidate => candidate.Confidence)
+                .ThenBy(candidate => candidate.Title, StringComparer.OrdinalIgnoreCase)
+                .Take(Math.Clamp(maxResults, 1, 12))
+                .ToArray();
         }
         catch (Exception ex)
         {
             _logger.LogDebug(ex, "UPCitemdb lookup failed for code {Code}", normalizedCode);
-            return null;
+            return [];
         }
     }
 
@@ -379,13 +540,18 @@ public sealed partial class ExternalBarcodeLookupService : IExternalBarcodeLooku
                 }
 
                 var similarity = ScoreTitleSimilarity(normalizedTitleQuery, title);
-                if (similarity < 0.48m)
+                if (similarity < 0.58m)
                 {
                     continue;
                 }
 
                 var platform = InferPlatform(title, category, platformHint);
-                var confidence = decimal.Min(0.9m, decimal.Max(0.6m, 0.58m + (similarity * 0.28m)));
+                if (HasConflictingNumericTokens(normalizedTitleQuery, title))
+                {
+                    continue;
+                }
+
+                var confidence = decimal.Min(0.92m, decimal.Max(0.6m, 0.54m + (similarity * 0.34m)));
                 var candidate = new ExternalBarcodeLookupResult
                 {
                     Code = code,
@@ -590,7 +756,12 @@ public sealed partial class ExternalBarcodeLookupService : IExternalBarcodeLooku
                 lookup.Title,
                 string.IsNullOrWhiteSpace(lookup.Platform) ? platformHint : lookup.Platform,
                 cancellationToken);
-            if (match is null || match.Score < 0.2m)
+            if (match is null || match.Score < TitleBankCanonicalizationMinScore)
+            {
+                return lookup;
+            }
+
+            if (HasConflictingNumericTokens(lookup.Title, match.Entry.Title))
             {
                 return lookup;
             }
@@ -617,6 +788,24 @@ public sealed partial class ExternalBarcodeLookupService : IExternalBarcodeLooku
             request.Headers.UserAgent.Clear();
             request.Headers.UserAgent.ParseAdd(userAgent);
         }
+    }
+
+    private static ExternalBarcodeLookupResult MergeProviderInfo(
+        ExternalBarcodeLookupResult primary,
+        ExternalBarcodeLookupResult secondary)
+    {
+        var primaryProvider = (primary.Provider ?? string.Empty).Trim();
+        var secondaryProvider = (secondary.Provider ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(secondaryProvider) ||
+            primaryProvider.Contains(secondaryProvider, StringComparison.OrdinalIgnoreCase))
+        {
+            return primary;
+        }
+
+        var provider = string.IsNullOrWhiteSpace(primaryProvider)
+            ? secondaryProvider
+            : $"{primaryProvider} | {secondaryProvider}";
+        return primary with { Provider = provider };
     }
 
     private async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
@@ -702,13 +891,8 @@ public sealed partial class ExternalBarcodeLookupService : IExternalBarcodeLooku
 
     private static bool LooksLikeVideoGame(string title, string category, string? platformHint)
     {
-        if (!string.IsNullOrWhiteSpace(platformHint))
-        {
-            return true;
-        }
-
         var searchable = $"{title} {category}".ToLowerInvariant();
-        if (searchable.Contains("controller", StringComparison.Ordinal))
+        if (NonGameAccessoryRegex().IsMatch(searchable))
         {
             return false;
         }
@@ -720,6 +904,11 @@ public sealed partial class ExternalBarcodeLookupService : IExternalBarcodeLooku
         }
 
         if (VideoGameKeywordRegex().IsMatch(searchable))
+        {
+            return true;
+        }
+
+        if (!string.IsNullOrWhiteSpace(platformHint))
         {
             return true;
         }
@@ -798,11 +987,6 @@ public sealed partial class ExternalBarcodeLookupService : IExternalBarcodeLooku
             return 1m;
         }
 
-        if (a.Contains(b, StringComparison.Ordinal) || b.Contains(a, StringComparison.Ordinal))
-        {
-            return 0.85m;
-        }
-
         var aTokens = a.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         var bTokens = b.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         if (aTokens.Length == 0 || bTokens.Length == 0)
@@ -811,7 +995,161 @@ public sealed partial class ExternalBarcodeLookupService : IExternalBarcodeLooku
         }
 
         var overlap = aTokens.Count(token => bTokens.Contains(token, StringComparer.Ordinal));
-        return (decimal)overlap / decimal.Max(aTokens.Length, bTokens.Length);
+        var overlapScore = (decimal)overlap / decimal.Max(aTokens.Length, bTokens.Length);
+
+        var containsScore = 0m;
+        if (a.Contains(b, StringComparison.Ordinal) || b.Contains(a, StringComparison.Ordinal))
+        {
+            var shorter = Math.Min(aTokens.Length, bTokens.Length);
+            var longer = Math.Max(aTokens.Length, bTokens.Length);
+            var expansion = longer - shorter;
+            containsScore = expansion switch
+            {
+                <= 1 => 0.9m,
+                2 => 0.82m,
+                3 => 0.76m,
+                _ => 0.68m
+            };
+        }
+
+        var score = decimal.Max(overlapScore, containsScore);
+        if (HasConflictingNumericTokens(a, b))
+        {
+            score -= 0.22m;
+        }
+
+        score -= ScoreEditionPenalty(a, b);
+        return decimal.Max(0m, decimal.Min(1m, score));
+    }
+
+    private static decimal ScoreUpcItemDbCandidate(
+        string title,
+        string category,
+        string inferredPlatform,
+        string normalizedPlatformHint,
+        decimal titleBankScore)
+    {
+        var normalizedTitle = NormalizeText(title);
+        var normalizedCategory = NormalizeText(category);
+        var normalizedPlatform = NormalizeText(inferredPlatform);
+
+        var score = 0.43m;
+        score += decimal.Min(0.36m, titleBankScore * 0.36m);
+
+        if (!string.IsNullOrWhiteSpace(normalizedCategory))
+        {
+            if (normalizedCategory.Contains("video game", StringComparison.Ordinal) ||
+                normalizedCategory.Contains("games", StringComparison.Ordinal))
+            {
+                score += 0.1m;
+            }
+            else if (normalizedCategory.Contains("software", StringComparison.Ordinal))
+            {
+                score += 0.06m;
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(normalizedPlatformHint))
+        {
+            if (normalizedPlatform == normalizedPlatformHint)
+            {
+                score += 0.08m;
+            }
+            else if (!string.IsNullOrWhiteSpace(normalizedPlatform) &&
+                     (normalizedPlatform.Contains(normalizedPlatformHint, StringComparison.Ordinal) ||
+                      normalizedPlatformHint.Contains(normalizedPlatform, StringComparison.Ordinal)))
+            {
+                score += 0.04m;
+            }
+            else if (!string.IsNullOrWhiteSpace(normalizedPlatform))
+            {
+                score -= 0.15m;
+            }
+        }
+
+        if (NonGameAccessoryRegex().IsMatch($"{normalizedTitle} {normalizedCategory}"))
+        {
+            score -= 0.35m;
+        }
+
+        score -= ScoreEditionPenalty(normalizedTitle);
+        return decimal.Max(0m, decimal.Min(0.94m, score));
+    }
+
+    private static decimal ScoreEditionPenalty(string normalizedTitle)
+    {
+        if (string.IsNullOrWhiteSpace(normalizedTitle))
+        {
+            return 0m;
+        }
+
+        if (EditionHeavyTokenRegex().IsMatch(normalizedTitle))
+        {
+            return 0.08m;
+        }
+
+        if (AddOnTokenRegex().IsMatch(normalizedTitle))
+        {
+            return 0.14m;
+        }
+
+        return 0m;
+    }
+
+    private static decimal ScoreEditionPenalty(string normalizedSource, string normalizedCandidate)
+    {
+        if (string.IsNullOrWhiteSpace(normalizedSource) || string.IsNullOrWhiteSpace(normalizedCandidate))
+        {
+            return 0m;
+        }
+
+        var sourceHasEdition = EditionHeavyTokenRegex().IsMatch(normalizedSource);
+        var candidateHasEdition = EditionHeavyTokenRegex().IsMatch(normalizedCandidate);
+        if (candidateHasEdition && !sourceHasEdition)
+        {
+            return 0.1m;
+        }
+
+        var sourceHasAddon = AddOnTokenRegex().IsMatch(normalizedSource);
+        var candidateHasAddon = AddOnTokenRegex().IsMatch(normalizedCandidate);
+        if (candidateHasAddon && !sourceHasAddon)
+        {
+            return 0.16m;
+        }
+
+        return 0m;
+    }
+
+    private static bool HasConflictingNumericTokens(string left, string right)
+    {
+        var leftTokens = ExtractNumericTokens(left);
+        var rightTokens = ExtractNumericTokens(right);
+        if (leftTokens.Count == 0 || rightTokens.Count == 0)
+        {
+            return false;
+        }
+
+        return !leftTokens.Overlaps(rightTokens);
+    }
+
+    private static HashSet<string> ExtractNumericTokens(string value)
+    {
+        var tokens = new HashSet<string>(StringComparer.Ordinal);
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return tokens;
+        }
+
+        foreach (Match match in NumericTokenRegex().Matches(value))
+        {
+            var token = match.Value.Trim();
+            if (!string.IsNullOrWhiteSpace(token))
+            {
+                tokens.Add(token);
+            }
+        }
+
+        return tokens;
     }
 
     private static string NormalizeCode(string code)
@@ -911,6 +1249,18 @@ public sealed partial class ExternalBarcodeLookupService : IExternalBarcodeLooku
 
     [GeneratedRegex(@"(playstation|ps[345]|xbox|nintendo|switch|wii|gamecube|video game|videogame|esrb|pegi)")]
     private static partial Regex VideoGameKeywordRegex();
+
+    [GeneratedRegex(@"\b(controller|headset|charger|console|skin|cable|stand|case|memory card|guide|strategy guide)\b")]
+    private static partial Regex NonGameAccessoryRegex();
+
+    [GeneratedRegex(@"\b(game of the year|goty|collector(?:'s)?|limited|definitive|ultimate|complete|special edition|platinum|greatest hits)\b")]
+    private static partial Regex EditionHeavyTokenRegex();
+
+[GeneratedRegex(@"\b(multiplayer pack|pack|dlc|expansion|season pass|add on|addon)\b")]
+private static partial Regex AddOnTokenRegex();
+
+    [GeneratedRegex(@"\d+")]
+    private static partial Regex NumericTokenRegex();
 
     private sealed class CachedLookupResult
     {

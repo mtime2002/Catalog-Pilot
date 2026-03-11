@@ -56,5 +56,5 @@ nunit-*.xml
 /Data/game-catalog.db
 
 # Ignore local appsettings file
-appsettings.json
-appsettings.Development.json
+/appsettings.json
+/appsettings.Development.json

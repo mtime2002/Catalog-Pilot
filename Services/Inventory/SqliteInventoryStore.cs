@@ -10,14 +10,20 @@ namespace CatalogPilot.Services;
 public sealed class SqliteInventoryStore : IInventoryStore
 {
     private readonly string _connectionString;
+    private readonly IGameCatalogStore _catalogStore;
+    private readonly ILogger<SqliteInventoryStore> _logger;
     private readonly SemaphoreSlim _initLock = new(1, 1);
     private readonly SemaphoreSlim _writeLock = new(1, 1);
     private bool _initialized;
 
     public SqliteInventoryStore(
         IWebHostEnvironment hostEnvironment,
-        IOptions<InventoryStoreOptions> options)
+        IOptions<InventoryStoreOptions> options,
+        IGameCatalogStore catalogStore,
+        ILogger<SqliteInventoryStore> logger)
     {
+        _catalogStore = catalogStore;
+        _logger = logger;
         var configuredPath = (options.Value.DatabasePath ?? string.Empty).Trim();
         if (string.IsNullOrWhiteSpace(configuredPath))
         {
@@ -176,6 +182,8 @@ public sealed class SqliteInventoryStore : IInventoryStore
         {
             _writeLock.Release();
         }
+
+        await PromoteInventoryTitleToCuratedAsync(record, cancellationToken);
 
         return record;
     }
@@ -479,6 +487,40 @@ public sealed class SqliteInventoryStore : IInventoryStore
             UpdatedUtc = ParseDateTimeOffset(reader.GetString(17)),
             ListedUtc = reader.IsDBNull(18) ? null : ParseDateTimeOffset(reader.GetString(18))
         };
+    }
+
+    private async Task PromoteInventoryTitleToCuratedAsync(
+        InventoryItemRecord record,
+        CancellationToken cancellationToken)
+    {
+        var itemName = (record.Input.ItemName ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(itemName))
+        {
+            return;
+        }
+
+        var entry = new GameTitleBankEntry
+        {
+            Title = itemName,
+            Platform = (record.Input.Platform ?? string.Empty).Trim(),
+            Franchise = string.Empty,
+            Aliases = []
+        };
+
+        try
+        {
+            await _catalogStore.PromoteTitleToCuratedAsync(
+                entry,
+                source: "inventory-add",
+                cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(
+                ex,
+                "Failed to promote inventory item {ItemId} to curated catalog.",
+                record.Id);
+        }
     }
 
     private static ListingInput CloneListingInput(ListingInput source)

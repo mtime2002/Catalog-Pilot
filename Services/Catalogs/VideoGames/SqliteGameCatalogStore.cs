@@ -140,12 +140,12 @@ public sealed class SqliteGameCatalogStore : IGameCatalogStore
     }
 
     public async Task<CuratedCatalogRefreshResult> RebuildCuratedCatalogAsync(
-        int maxPerPlatform = 2000,
+        int maxPerPlatform = 5000,
         CancellationToken cancellationToken = default)
     {
         await InitializeAsync(cancellationToken);
         var startedUtc = DateTimeOffset.UtcNow;
-        var appliedMaxPerPlatform = Math.Clamp(maxPerPlatform, 100, 5000);
+        var appliedMaxPerPlatform = Math.Clamp(maxPerPlatform, 100, 10000);
 
         await _writeLock.WaitAsync(cancellationToken);
         try
@@ -456,6 +456,78 @@ public sealed class SqliteGameCatalogStore : IGameCatalogStore
         }
     }
 
+    public async Task PromoteTitleToCuratedAsync(
+        GameTitleBankEntry entry,
+        string source,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(entry.Title))
+        {
+            return;
+        }
+
+        await InitializeAsync(cancellationToken);
+        await _writeLock.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = new SqliteConnection(_connectionString);
+            await connection.OpenAsync(cancellationToken);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+
+            var titleId = await UpsertTitleInternalAsync(connection, transaction, entry, source, cancellationToken);
+            var normalizedPlatform = NormalizeText(entry.Platform);
+            var nextPlatformRank = 1;
+
+            if (!string.IsNullOrWhiteSpace(normalizedPlatform))
+            {
+                await using var rankCommand = connection.CreateCommand();
+                rankCommand.Transaction = transaction;
+                rankCommand.CommandText = """
+                    SELECT COALESCE(MAX(c.platform_rank), 0)
+                    FROM curated_titles c
+                    INNER JOIN game_titles t ON t.id = c.title_id
+                    WHERE t.normalized_platform = $platform;
+                    """;
+                rankCommand.Parameters.AddWithValue("$platform", normalizedPlatform);
+                var rankValue = await rankCommand.ExecuteScalarAsync(cancellationToken);
+                nextPlatformRank = Convert.ToInt32(rankValue) + 1;
+            }
+
+            await using var curateCommand = connection.CreateCommand();
+            curateCommand.Transaction = transaction;
+            curateCommand.CommandText = """
+                INSERT INTO curated_titles (
+                    title_id,
+                    sellability_score,
+                    market_signals,
+                    platform_rank,
+                    updated_utc)
+                VALUES (
+                    $titleId,
+                    $sellabilityScore,
+                    $marketSignals,
+                    $platformRank,
+                    $updatedUtc)
+                ON CONFLICT(title_id) DO UPDATE SET
+                    sellability_score = MAX(curated_titles.sellability_score, excluded.sellability_score),
+                    market_signals = MAX(curated_titles.market_signals, excluded.market_signals),
+                    updated_utc = excluded.updated_utc;
+                """;
+            curateCommand.Parameters.AddWithValue("$titleId", titleId);
+            curateCommand.Parameters.AddWithValue("$sellabilityScore", 75.0d);
+            curateCommand.Parameters.AddWithValue("$marketSignals", 75);
+            curateCommand.Parameters.AddWithValue("$platformRank", nextPlatformRank);
+            curateCommand.Parameters.AddWithValue("$updatedUtc", DateTimeOffset.UtcNow.ToString("O"));
+            await curateCommand.ExecuteNonQueryAsync(cancellationToken);
+
+            await transaction.CommitAsync(cancellationToken);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public async Task<CatalogBarcodeMatchResult?> FindByBarcodeAsync(
         string code,
         string? platformHint = null,
@@ -470,40 +542,25 @@ public sealed class SqliteGameCatalogStore : IGameCatalogStore
         await InitializeAsync(cancellationToken);
         await using var connection = new SqliteConnection(_connectionString);
         await connection.OpenAsync(cancellationToken);
-        var useCuratedOnly = await HasCuratedTitlesAsync(connection, cancellationToken);
+        var normalizedPlatformHint = NormalizeText(platformHint);
 
         await using var command = connection.CreateCommand();
-        command.CommandText = useCuratedOnly
-            ? """
-                SELECT
-                    t.title,
-                    t.platform,
-                    t.franchise,
-                    t.aliases_json,
-                    b.code,
-                    b.confidence,
-                    c.sellability_score
-                FROM game_barcodes b
-                INNER JOIN game_titles t ON t.id = b.title_id
-                INNER JOIN curated_titles c ON c.title_id = t.id
-                WHERE b.code = $code;
-                """
-            : """
-                SELECT
-                    t.title,
-                    t.platform,
-                    t.franchise,
-                    t.aliases_json,
-                    b.code,
-                    b.confidence,
-                    0 AS sellability_score
-                FROM game_barcodes b
-                INNER JOIN game_titles t ON t.id = b.title_id
-                WHERE b.code = $code;
-                """;
+        command.CommandText = """
+            SELECT
+                t.title,
+                t.platform,
+                t.franchise,
+                t.aliases_json,
+                b.code,
+                b.confidence,
+                COALESCE(c.sellability_score, 0) AS sellability_score
+            FROM game_barcodes b
+            INNER JOIN game_titles t ON t.id = b.title_id
+            LEFT JOIN curated_titles c ON c.title_id = t.id
+            WHERE b.code = $code;
+            """;
         command.Parameters.AddWithValue("$code", normalizedCode);
 
-        var normalizedPlatformHint = NormalizeText(platformHint);
         CatalogBarcodeMatchResult? best = null;
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
@@ -612,7 +669,6 @@ public sealed class SqliteGameCatalogStore : IGameCatalogStore
             FROM game_titles t
             LEFT JOIN curated_titles c ON c.title_id = t.id
             WHERE {string.Join(" OR ", whereParts)}
-            LIMIT 1500;
             """;
 
         var normalizedPlatformHint = NormalizeText(platformHint);
@@ -644,7 +700,6 @@ public sealed class SqliteGameCatalogStore : IGameCatalogStore
                         COALESCE(c.sellability_score, 0)
                     FROM game_titles t
                     LEFT JOIN curated_titles c ON c.title_id = t.id
-                    LIMIT 5000;
                     """;
             }
             else
@@ -660,8 +715,7 @@ public sealed class SqliteGameCatalogStore : IGameCatalogStore
                         COALESCE(c.sellability_score, 0)
                     FROM game_titles t
                     LEFT JOIN curated_titles c ON c.title_id = t.id
-                    WHERE t.normalized_platform = $platformHint
-                    LIMIT 5000;
+                    WHERE t.normalized_platform = $platformHint;
                     """;
                 fallbackCommand.Parameters.AddWithValue("$platformHint", normalizedPlatformHint);
             }
@@ -1367,12 +1421,15 @@ public sealed class SqliteGameCatalogStore : IGameCatalogStore
         "season pass",
         "soundtrack",
         "ost",
-        "expansion",
+        "expansion pass",
+        "expansion pack",
         "beta",
         "demo",
         "prototype",
-        "trial",
-        "avatar",
+        "free trial",
+        "trial version",
+        "avatar item",
+        "avatar pack",
         "theme",
         "wallpaper",
         "test build",

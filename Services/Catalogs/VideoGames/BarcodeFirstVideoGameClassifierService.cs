@@ -52,14 +52,14 @@ public sealed class BarcodeFirstVideoGameClassifierService : IVideoGameClassifie
         ClassificationResult ocrResult,
         CancellationToken cancellationToken)
     {
-        if (!CanRecoverBarcodeFromTitle(ocrResult))
+        if (!TryResolveRecoveryTitle(ocrResult, out var recoveryTitle))
         {
             return null;
         }
 
         var platformHint = ResolvePlatformHint(input, ocrResult);
         var lookup = await _externalBarcodeLookupService.LookupByTitleAsync(
-            ocrResult.SuggestedTitle,
+            recoveryTitle,
             platformHint,
             cancellationToken);
         if (lookup is null || string.IsNullOrWhiteSpace(lookup.Code))
@@ -67,7 +67,12 @@ public sealed class BarcodeFirstVideoGameClassifierService : IVideoGameClassifie
             return null;
         }
 
-        return BuildRecoveredBarcodeClassification(ocrResult, lookup);
+        if (ScoreTitleOverlap(recoveryTitle, lookup.Title) < 0.34m)
+        {
+            return null;
+        }
+
+        return BuildRecoveredBarcodeClassification(ocrResult, lookup, recoveryTitle);
     }
 
     private static bool ShouldTryVisionFallback(ClassificationResult ocrResult)
@@ -133,19 +138,58 @@ public sealed class BarcodeFirstVideoGameClassifierService : IVideoGameClassifie
         return shortOrNumeric / (double)tokens.Length >= 0.55;
     }
 
-    private static bool CanRecoverBarcodeFromTitle(ClassificationResult ocrResult)
+    private static bool TryResolveRecoveryTitle(ClassificationResult ocrResult, out string title)
     {
-        if (string.IsNullOrWhiteSpace(ocrResult.SuggestedTitle))
+        title = string.Empty;
+
+        if (!string.IsNullOrWhiteSpace(ocrResult.SuggestedTitle) &&
+            !LooksLikeNoisyTitle(ocrResult.SuggestedTitle))
         {
-            return false;
+            var cleaned = SanitizeRecoveryTitle(ocrResult.SuggestedTitle);
+            if (!string.IsNullOrWhiteSpace(cleaned))
+            {
+                title = cleaned;
+                return true;
+            }
         }
 
-        if (LooksLikeNoisyTitle(ocrResult.SuggestedTitle))
+        if (!string.IsNullOrWhiteSpace(ocrResult.BankMatchedTitle) &&
+            !LooksLikeNoisyTitle(ocrResult.BankMatchedTitle) &&
+            ocrResult.BankMatchScore >= 0.24m)
         {
-            return false;
+            var cleaned = SanitizeRecoveryTitle(ocrResult.BankMatchedTitle);
+            if (!string.IsNullOrWhiteSpace(cleaned))
+            {
+                title = cleaned;
+                return true;
+            }
         }
 
-        return ocrResult.BankMatchScore >= 0.52m || ocrResult.Confidence >= 0.75m;
+        if (TryGetItemSpecificValue(ocrResult, "OCR Candidate Title", out var ocrCandidate) &&
+            !LooksLikeNoisyTitle(ocrCandidate) &&
+            (ocrResult.Confidence >= 0.72m || ocrResult.BankMatchScore >= 0.24m))
+        {
+            var cleaned = SanitizeRecoveryTitle(ocrCandidate);
+            if (!string.IsNullOrWhiteSpace(cleaned))
+            {
+                title = cleaned;
+                return true;
+            }
+        }
+
+        if (TryGetItemSpecificValue(ocrResult, "Bank Candidate Title", out var bankCandidate) &&
+            !LooksLikeNoisyTitle(bankCandidate) &&
+            ocrResult.BankMatchScore >= 0.2m)
+        {
+            var cleaned = SanitizeRecoveryTitle(bankCandidate);
+            if (!string.IsNullOrWhiteSpace(cleaned))
+            {
+                title = cleaned;
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static string ResolvePlatformHint(ListingInput input, ClassificationResult ocrResult)
@@ -165,7 +209,8 @@ public sealed class BarcodeFirstVideoGameClassifierService : IVideoGameClassifie
 
     private static ClassificationResult BuildRecoveredBarcodeClassification(
         ClassificationResult ocrResult,
-        ExternalBarcodeLookupResult lookup)
+        ExternalBarcodeLookupResult lookup,
+        string recoveryTitle)
     {
         var platform = string.IsNullOrWhiteSpace(lookup.Platform)
             ? ocrResult.SuggestedPlatform
@@ -182,9 +227,9 @@ public sealed class BarcodeFirstVideoGameClassifierService : IVideoGameClassifie
         return new ClassificationResult
         {
             Source = "OCR + External Title->Barcode Recovery",
-            SuggestedTitle = string.IsNullOrWhiteSpace(lookup.Title) ? ocrResult.SuggestedTitle : lookup.Title,
+            SuggestedTitle = string.IsNullOrWhiteSpace(lookup.Title) ? recoveryTitle : lookup.Title,
             SuggestedPlatform = platform,
-            BankMatchedTitle = string.IsNullOrWhiteSpace(lookup.Title) ? ocrResult.BankMatchedTitle : lookup.Title,
+            BankMatchedTitle = string.IsNullOrWhiteSpace(lookup.Title) ? recoveryTitle : lookup.Title,
             BankMatchedPlatform = platform,
             BankMatchScore = decimal.Max(ocrResult.BankMatchScore, lookup.Confidence),
             SuggestedCondition = ocrResult.SuggestedCondition,
@@ -194,5 +239,98 @@ public sealed class BarcodeFirstVideoGameClassifierService : IVideoGameClassifie
             Confidence = decimal.Min(0.97m, decimal.Max(ocrResult.Confidence, lookup.Confidence + 0.12m)),
             ItemSpecifics = specifics
         };
+    }
+
+    private static bool TryGetItemSpecificValue(ClassificationResult result, string key, out string value)
+    {
+        value = string.Empty;
+        if (result.ItemSpecifics is null || !result.ItemSpecifics.TryGetValue(key, out var found))
+        {
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(found))
+        {
+            return false;
+        }
+
+        value = found.Trim();
+        return true;
+    }
+
+    private static decimal ScoreTitleOverlap(string source, string candidate)
+    {
+        if (string.IsNullOrWhiteSpace(source) || string.IsNullOrWhiteSpace(candidate))
+        {
+            return 0m;
+        }
+
+        static string[] Tokens(string value) => value
+            .ToLowerInvariant()
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(token => new string(token.Where(char.IsLetterOrDigit).ToArray()))
+            .Where(token => token.Length >= 2)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        var a = Tokens(source);
+        var b = Tokens(candidate);
+        if (a.Length == 0 || b.Length == 0)
+        {
+            return 0m;
+        }
+
+        var overlap = a.Count(token => b.Contains(token, StringComparer.Ordinal));
+        return (decimal)overlap / decimal.Max(a.Length, b.Length);
+    }
+
+    private static string SanitizeRecoveryTitle(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        var lowered = value
+            .Replace(':', ' ')
+            .Replace('-', ' ')
+            .Replace('.', ' ')
+            .ToLowerInvariant();
+
+        var stopPhrases = new[]
+        {
+            " is a trademark",
+            " trademark of",
+            " created and developed",
+            " sony computer",
+            " entertainment america",
+            " www "
+        };
+
+        var cutoff = lowered.Length;
+        foreach (var phrase in stopPhrases)
+        {
+            var index = lowered.IndexOf(phrase, StringComparison.Ordinal);
+            if (index >= 0 && index < cutoff)
+            {
+                cutoff = index;
+            }
+        }
+
+        var window = cutoff < lowered.Length ? lowered[..cutoff] : lowered;
+        var tokens = window
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(token => token.Any(char.IsLetterOrDigit))
+            .Select(token => new string(token.Where(char.IsLetterOrDigit).ToArray()))
+            .Where(token => token.Length >= 2)
+            .Take(8)
+            .ToArray();
+
+        if (tokens.Length == 0)
+        {
+            return string.Empty;
+        }
+
+        return string.Join(' ', tokens);
     }
 }

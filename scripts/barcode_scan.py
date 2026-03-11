@@ -397,7 +397,7 @@ def scan_with_zbar(image_path: str) -> tuple[list[dict[str, str]], str]:
     try:
         from pyzbar.pyzbar import ZBarSymbol, decode as zbar_decode  # type: ignore
     except Exception as exc:
-        return ([], f"pyzbar import failed: {exc}")
+        return ([], f"pyzbar import failed: {exc} (python: {sys.executable})")
 
     image = cv2.imread(image_path)
     if image is None:

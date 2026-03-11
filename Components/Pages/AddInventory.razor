@@ -2,11 +2,14 @@
 @rendermode InteractiveServer
 @attribute [Authorize]
 @using CatalogPilot.Models
+@using Microsoft.JSInterop
 @using System.Text.Json
 @implements IAsyncDisposable
 @inject AuthenticationStateProvider AuthenticationStateProvider
 @inject IPhotoStorageService PhotoStorageService
 @inject IVideoGameClassifierService ClassifierService
+@inject IExternalBarcodeLookupService ExternalBarcodeLookupService
+@inject IGameCatalogStore GameCatalogStore
 @inject IEbayPricingService PricingService
 @inject IInventoryStore InventoryStore
 @inject IJSRuntime JSRuntime
@@ -30,6 +33,7 @@
 
     <section class="panel">
         <div class="button-row" style="margin-top:0.75rem;">
+            <button type="button" class="btn btn-primary" @onclick="OpenScanNewItemAsync">Scan New Item</button>
             <button type="button" class="btn btn-primary" @onclick="AddDraft">Add Another Item</button>
             <button type="button" class="btn btn-danger" @onclick="ClearAllDraftsAsync">Clear Drafts</button>
         </div>
@@ -64,27 +68,116 @@
                             </button>
                         }
 
-                        <label class="inventory-thumb-add" for="@($"draft-upload-{draft.Id}")" title="Add images">
+                        <button type="button"
+                                class="inventory-thumb-add"
+                                title="Add images"
+                                @onclick="() => TogglePhotoSourcePicker(draft.Id)">
                             <span>+</span>
                             <small>Add</small>
-                        </label>
+                        </button>
                     </div>
-                    <InputFile id="@($"draft-upload-{draft.Id}")"
+                    @if (draft.ShowPhotoSourcePicker)
+                    {
+                        <div class="inventory-photo-source-picker">
+                            <label class="btn btn-primary"
+                                   for="@($"draft-upload-camera-{draft.Id}")"
+                                   @onclick="() => HidePhotoSourcePicker(draft.Id)">
+                                Take Photo
+                            </label>
+                            <label class="btn"
+                                   for="@($"draft-upload-files-{draft.Id}")"
+                                   @onclick="() => HidePhotoSourcePicker(draft.Id)">
+                                Choose Files
+                            </label>
+                        </div>
+                    }
+                    <InputFile id="@($"draft-upload-files-{draft.Id}")"
                                class="inventory-thumb-input"
                                OnChange="@(e => HandleFilesSelectedAsync(draft, e))"
                                multiple
                                accept="image/*" />
+                    <InputFile id="@($"draft-upload-camera-{draft.Id}")"
+                               class="inventory-thumb-input"
+                               OnChange="@(e => HandleFilesSelectedAsync(draft, e))"
+                               accept="image/*"
+                               capture="environment" />
                 </div>
 
                 <div class="inventory-condensed-main">
-                    <label>
-                        Title
-                        <input class="input"
-                                @bind="draft.Input.ItemName"
-                                @bind:event="oninput"
-                                @bind:after="HandleDraftFieldChangedAsync"
-                                placeholder="Auto-filled from images when available" />
-                    </label>
+                    <div class="inventory-title-selector">
+                        <span class="inventory-title-selector-label">Title</span>
+                        <div class="inventory-title-selector-controls">
+                            <button type="button"
+                                    class="inventory-title-current @(string.IsNullOrWhiteSpace(draft.Input.ItemName) ? "inventory-title-current-empty" : string.Empty)"
+                                    @onclick="() => ToggleTitlePickerAsync(draft.Id)"
+                                    disabled="@draft.IsSaving"
+                                    title="Open title picker">
+                                @GetDraftSelectedTitle(draft)
+                            </button>
+                            <button type="button"
+                                    class="btn inventory-title-clear"
+                                    @onclick="() => ClearDraftTitleAsync(draft.Id)"
+                                    disabled="@(draft.IsSaving || string.IsNullOrWhiteSpace(draft.Input.ItemName))">
+                                Clear
+                            </button>
+                            <button type="button"
+                                    class="btn inventory-title-toggle"
+                                    @onclick="() => ToggleTitlePickerAsync(draft.Id)"
+                                    aria-expanded="@draft.ShowTitlePicker"
+                                    disabled="@draft.IsSaving"
+                                    title="Toggle title picker">
+                                @(draft.ShowTitlePicker ? "\u25B2" : "\u25BC")
+                            </button>
+                        </div>
+                        @if (draft.ShowTitlePicker)
+                        {
+                            <section class="inventory-title-picker">
+                                <div class="inventory-title-search-row">
+                                    <input class="input"
+                                           placeholder="Search catalog title"
+                                           @bind="draft.TitleSearchQuery"
+                                           @bind:event="oninput"
+                                           disabled="@draft.TitleSearchBusy" />
+                                    <button type="button"
+                                            class="btn"
+                                            @onclick="() => SearchDraftTitlesAsync(draft.Id)"
+                                            disabled="@draft.TitleSearchBusy">
+                                        @(draft.TitleSearchBusy ? "Searching..." : "Search")
+                                    </button>
+                                </div>
+                                @if (draft.TitleSearchBusy)
+                                {
+                                    <div class="inventory-title-loading">
+                                        <span class="inventory-loading-dot"></span>
+                                        <span>Loading catalog matches...</span>
+                                    </div>
+                                }
+                                @if (!string.IsNullOrWhiteSpace(draft.TitleSearchStatus))
+                                {
+                                    <p class="muted">@draft.TitleSearchStatus</p>
+                                }
+                                <div class="inventory-title-results">
+                                    @foreach (var match in draft.TitleSearchResults)
+                                    {
+                                        <button type="button"
+                                                class="inventory-title-result"
+                                                @onclick="() => SelectDraftTitleAsync(draft.Id, match)"
+                                                disabled="@draft.IsSaving">
+                                            <span class="inventory-title-result-title">@DisplayOrFallback(match.Entry.Title)</span>
+                                            <span class="inventory-title-result-meta">
+                                                <span>@DisplayOrFallback(match.Entry.Platform)</span>
+                                                <span>Score: @match.Score.ToString("0.00")</span>
+                                            </span>
+                                        </button>
+                                    }
+                                    @if (!draft.TitleSearchBusy && draft.TitleSearchResults.Count == 0 && string.IsNullOrWhiteSpace(draft.TitleSearchStatus))
+                                    {
+                                        <p class="muted">No results yet. Search by title.</p>
+                                    }
+                                </div>
+                            </section>
+                        }
+                    </div>
                     <label>
                         Platform
                         <input class="input"
@@ -149,6 +242,13 @@
                     }
                 </div>
                 <div class="button-row inventory-condensed-actions">
+                    <button type="button"
+                            class="btn"
+                            @onclick="() => OpenBarcodeScannerAsync(draft.Id)"
+                            disabled="@draft.IsSaving"
+                            title="Scan barcode with camera">
+                        scan
+                    </button>
                     <button type="button"
                             class="btn btn-primary"
                             @onclick="() => ConfirmAddToInventoryAsync(draft)"
@@ -216,6 +316,83 @@
     </div>
 }
 
+@if (_scannerOpen)
+{
+    <div class="modal-overlay" @onclick="CloseBarcodeScannerAsync">
+        <section class="panel barcode-scanner-card" @onclick:stopPropagation="true">
+            <header class="inventory-modal-head">
+                <h3>Live Barcode Scan</h3>
+                <button type="button" class="btn" @onclick="CloseBarcodeScannerAsync">Close</button>
+            </header>
+            <video id="@BarcodeScannerVideoId" class="barcode-scanner-video" autoplay playsinline muted></video>
+            <p class="muted">@_scannerStatus</p>
+        </section>
+    </div>
+}
+
+@if (_scanResultPickerOpen)
+{
+    <div class="modal-overlay" @onclick="CloseScanResultPicker">
+        <section class="panel scan-result-picker-card" @onclick:stopPropagation="true">
+            <header class="inventory-modal-head">
+                <h3>Choose Scan Match</h3>
+                <button type="button" class="btn" @onclick="CloseScanResultPicker">Close</button>
+            </header>
+            <p class="muted">Scanned code: @_scanResultBarcode</p>
+            <div class="scan-result-search-row">
+                <input class="input"
+                       placeholder="Can't find it? Search catalog title (e.g., Kirby Dream Collection)"
+                       @bind="_scanResultTitleQuery"
+                       @bind:event="oninput"
+                       disabled="@(_scanResultPickerLoading || _scanResultTitleSearchBusy || _scanResultSubmitting)" />
+                <button type="button"
+                        class="btn"
+                        @onclick="SearchScanResultTitlesAsync"
+                        disabled="@(_scanResultPickerLoading || _scanResultTitleSearchBusy || _scanResultSubmitting)">
+                    @(_scanResultTitleSearchBusy ? "Searching..." : "Search Catalog")
+                </button>
+            </div>
+            @if (_scanResultPickerLoading)
+            {
+                <div class="scan-result-loading">
+                    <span class="inventory-loading-dot"></span>
+                    <span>Loading scan matches from catalog...</span>
+                </div>
+            }
+            else if (_scanResultTitleSearchBusy)
+            {
+                <div class="scan-result-loading">
+                    <span class="inventory-loading-dot"></span>
+                    <span>Searching catalog...</span>
+                </div>
+            }
+            <div class="scan-result-list">
+                @foreach (var candidate in _scanResultCandidates)
+                {
+                    <button type="button"
+                            class="scan-result-option"
+                            @onclick="() => SelectScanResultAsync(candidate)"
+                            disabled="@(_scanResultSubmitting || _scanResultPickerLoading)">
+                        <div class="scan-result-title">@DisplayOrFallback(candidate.Title)</div>
+                        <div class="scan-result-meta">
+                            <span>@DisplayOrFallback(candidate.Platform)</span>
+                            <span>@DisplayOrFallback(candidate.Provider)</span>
+                            <span>Confidence: @candidate.Confidence.ToString("0.00")</span>
+                        </div>
+                    </button>
+                }
+                @if (!_scanResultPickerLoading && _scanResultCandidates.Count == 0)
+                {
+                    <p class="muted">No automatic matches found. Search the catalog above or choose No Match.</p>
+                }
+            </div>
+            <div class="button-row">
+                <button type="button" class="btn" @onclick="SkipScanResultAsync" disabled="@(_scanResultSubmitting || _scanResultPickerLoading)">No Match</button>
+            </div>
+        </section>
+    </div>
+}
+
 @code {
     private const string DraftCacheKey = "catalogpilot.inventory.add.drafts.v1";
     private readonly List<InventoryDraft> _drafts = [];
@@ -230,6 +407,23 @@
     private string _expandedImageName = string.Empty;
     private string _statusMessage = string.Empty;
     private string _errorMessage = string.Empty;
+    private const string BarcodeScannerVideoId = "inventory-live-barcode-video";
+    private DotNetObjectReference<AddInventory>? _scannerDotNetRef;
+    private Guid? _scannerDraftId;
+    private bool _scannerAddDirectMode;
+    private bool _scannerOpen;
+    private bool _scannerPendingStart;
+    private string _scannerStatus = string.Empty;
+    private bool _scanResultPickerOpen;
+    private bool _scanResultAddDirectMode;
+    private bool _scanResultPickerLoading;
+    private bool _scanResultSubmitting;
+    private Guid? _scanResultDraftId;
+    private string _scanResultBarcode = string.Empty;
+    private string _scanResultFormat = string.Empty;
+    private readonly List<ExternalBarcodeLookupResult> _scanResultCandidates = [];
+    private string _scanResultTitleQuery = string.Empty;
+    private bool _scanResultTitleSearchBusy;
 
     protected override async Task OnInitializedAsync()
     {
@@ -240,19 +434,38 @@
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        if (!firstRender)
+        if (firstRender)
         {
-            return;
+            await RestoreDraftsFromCacheAsync();
+            StartDraftAutosave();
         }
 
-        await RestoreDraftsFromCacheAsync();
-        StartDraftAutosave();
+        if (_scannerOpen && _scannerPendingStart)
+        {
+            _scannerPendingStart = false;
+            await StartBarcodeScannerAsync();
+        }
     }
 
     private void AddDraft()
     {
-        _drafts.Add(new InventoryDraft());
+        CreateDraft(insertAtTop: false);
         _ = PersistDraftsAsync();
+    }
+
+    private InventoryDraft CreateDraft(bool insertAtTop)
+    {
+        var draft = new InventoryDraft();
+        if (insertAtTop)
+        {
+            _drafts.Insert(0, draft);
+        }
+        else
+        {
+            _drafts.Add(draft);
+        }
+
+        return draft;
     }
 
     private void RemoveDraft(Guid draftId)
@@ -284,6 +497,168 @@
 
         draft.ShowAttributes = !draft.ShowAttributes;
         _ = PersistDraftsAsync();
+    }
+
+    private void TogglePhotoSourcePicker(Guid draftId)
+    {
+        foreach (var draft in _drafts)
+        {
+            draft.ShowPhotoSourcePicker = draft.Id == draftId && !draft.ShowPhotoSourcePicker;
+        }
+
+        _ = PersistDraftsAsync();
+    }
+
+    private void HidePhotoSourcePicker(Guid draftId)
+    {
+        var draft = _drafts.FirstOrDefault(item => item.Id == draftId);
+        if (draft is null || !draft.ShowPhotoSourcePicker)
+        {
+            return;
+        }
+
+        draft.ShowPhotoSourcePicker = false;
+        _ = PersistDraftsAsync();
+    }
+
+    private async Task ToggleTitlePickerAsync(Guid draftId)
+    {
+        var draft = _drafts.FirstOrDefault(item => item.Id == draftId);
+        if (draft is null)
+        {
+            return;
+        }
+
+        var nextState = !draft.ShowTitlePicker;
+        foreach (var item in _drafts)
+        {
+            if (item.Id != draftId)
+            {
+                item.ShowTitlePicker = false;
+                item.TitleSearchBusy = false;
+            }
+        }
+
+        draft.ShowTitlePicker = nextState;
+        if (nextState && string.IsNullOrWhiteSpace(draft.TitleSearchQuery))
+        {
+            draft.TitleSearchQuery = ResolveValue(
+                draft.Input.ItemName,
+                draft.SuggestedClassification?.BankMatchedTitle,
+                draft.SuggestedClassification?.SuggestedTitle);
+        }
+
+        if (nextState)
+        {
+            draft.TitleSearchBusy = true;
+            draft.TitleSearchStatus = "Loading catalog matches...";
+            await PersistDraftsAsync();
+            await InvokeAsync(StateHasChanged);
+            _ = LoadTitlePickerSuggestionsAsync(draftId);
+        }
+        else
+        {
+            draft.TitleSearchBusy = false;
+            await PersistDraftsAsync();
+        }
+    }
+
+    private async Task LoadTitlePickerSuggestionsAsync(Guid draftId)
+    {
+        try
+        {
+            await SearchDraftTitlesAsync(draftId, skipEmptyQueryMessage: true);
+        }
+        catch (Exception ex)
+        {
+            var draft = _drafts.FirstOrDefault(item => item.Id == draftId);
+            if (draft is null)
+            {
+                return;
+            }
+
+            draft.TitleSearchBusy = false;
+            draft.TitleSearchStatus = $"Search failed: {ex.Message}";
+            await PersistDraftsAsync();
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private async Task ClearDraftTitleAsync(Guid draftId)
+    {
+        var draft = _drafts.FirstOrDefault(item => item.Id == draftId);
+        if (draft is null)
+        {
+            return;
+        }
+
+        draft.Input.ItemName = string.Empty;
+        draft.TitleSearchQuery = string.Empty;
+        draft.TitleSearchResults.Clear();
+        draft.TitleSearchStatus = string.Empty;
+        await HandleDraftFieldChangedAsync();
+    }
+
+    private async Task SearchDraftTitlesAsync(Guid draftId, bool skipEmptyQueryMessage = false)
+    {
+        var draft = _drafts.FirstOrDefault(item => item.Id == draftId);
+        if (draft is null)
+        {
+            return;
+        }
+
+        draft.TitleSearchBusy = true;
+        draft.TitleSearchStatus = string.Empty;
+        await InvokeAsync(StateHasChanged);
+
+        try
+        {
+            var query = (draft.TitleSearchQuery ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(query))
+            {
+                draft.TitleSearchResults.Clear();
+                draft.TitleSearchStatus = skipEmptyQueryMessage ? string.Empty : "Enter a title to search.";
+                return;
+            }
+
+            var platformHint = string.IsNullOrWhiteSpace(draft.Input.Platform)
+                ? null
+                : draft.Input.Platform.Trim();
+            var matches = await GameCatalogStore.SearchSimilarTitlesAsync(query, platformHint, maxResults: 12);
+            draft.TitleSearchResults = matches.ToList();
+            draft.TitleSearchStatus = matches.Count == 0 ? "No catalog title matches found." : string.Empty;
+        }
+        catch (Exception ex)
+        {
+            draft.TitleSearchResults.Clear();
+            draft.TitleSearchStatus = $"Search failed: {ex.Message}";
+        }
+        finally
+        {
+            draft.TitleSearchBusy = false;
+            await PersistDraftsAsync();
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private async Task SelectDraftTitleAsync(Guid draftId, GameTitleMatchResult match)
+    {
+        var draft = _drafts.FirstOrDefault(item => item.Id == draftId);
+        if (draft is null)
+        {
+            return;
+        }
+
+        draft.Input.ItemName = (match.Entry.Title ?? string.Empty).Trim();
+        if (!string.IsNullOrWhiteSpace(match.Entry.Platform))
+        {
+            draft.Input.Platform = match.Entry.Platform.Trim();
+        }
+
+        draft.TitleSearchQuery = draft.Input.ItemName;
+        draft.ShowTitlePicker = false;
+        draft.TitleSearchStatus = string.Empty;
+        await HandleDraftFieldChangedAsync();
     }
 
     private void AddAttributeRow(Guid draftId)
@@ -361,6 +736,7 @@
     {
         draft.ErrorMessage = string.Empty;
         draft.Message = string.Empty;
+        draft.ShowPhotoSourcePicker = false;
         try
         {
             RequestDraftAnalysisCancellation(draft);
@@ -374,13 +750,16 @@
                 return;
             }
 
-            draft.Message = "Checking barcodes and autofilling...";
             draft.AnalysisVersion++;
             var version = draft.AnalysisVersion;
             var analysisCts = new CancellationTokenSource();
             draft.AnalysisCts = analysisCts;
             draft.IsAnalyzing = true;
-            _ = AnalyzeDraftAsync(draft, version, analysisCts);
+            var analyzeTask = AnalyzeDraftAsync(draft, version, analysisCts);
+            _ = analyzeTask.ContinueWith(_ => { 
+                draft.Message = "";
+                InvokeAsync(StateHasChanged);
+            });
             await PersistDraftsAsync();
         }
         catch (Exception ex)
@@ -393,6 +772,7 @@
     {
         try
         {
+            draft.Message = "autofilling...";
             await InvokeAsync(() =>
             {
                 draft.IsAnalyzing = true;
@@ -693,6 +1073,30 @@
         }
     }
 
+    private static void UpsertAttributeRow(InventoryDraft draft, string key, string value)
+    {
+        if (string.IsNullOrWhiteSpace(key) || string.IsNullOrWhiteSpace(value))
+        {
+            return;
+        }
+
+        var normalizedKey = key.Trim();
+        var normalizedValue = value.Trim();
+        var existing = draft.AttributeRows.FirstOrDefault(row =>
+            row.Key.Equals(normalizedKey, StringComparison.OrdinalIgnoreCase));
+        if (existing is null)
+        {
+            draft.AttributeRows.Add(new DraftAttributeRow
+            {
+                Key = normalizedKey,
+                Value = normalizedValue
+            });
+            return;
+        }
+
+        existing.Value = normalizedValue;
+    }
+
     private static ListingInput CloneListingInput(ListingInput input)
     {
         return new ListingInput
@@ -742,6 +1146,50 @@
         };
     }
 
+    private static ClassificationResult BuildScannedBarcodeClassification(
+        ListingInput input,
+        ExternalBarcodeLookupResult lookup,
+        string normalizedCode,
+        string format)
+    {
+        var platform = ResolveValue(input.Platform, lookup.Platform);
+        var specifics = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Detected Game Code"] = normalizedCode,
+            ["Barcode Provider"] = lookup.Provider
+        };
+        if (!string.IsNullOrWhiteSpace(format))
+        {
+            specifics["Barcode Format"] = format;
+        }
+        if (!string.IsNullOrWhiteSpace(lookup.Brand))
+        {
+            specifics["Publisher/Brand"] = lookup.Brand;
+        }
+        if (!string.IsNullOrWhiteSpace(platform))
+        {
+            specifics["Platform"] = platform;
+        }
+
+        var title = ResolveValue(lookup.Title, input.ItemName);
+        var condition = string.IsNullOrWhiteSpace(input.Condition) ? "Used" : input.Condition.Trim();
+        return new ClassificationResult
+        {
+            Source = "Live Camera Barcode Scan",
+            SuggestedTitle = title,
+            SuggestedPlatform = platform,
+            BankMatchedTitle = title,
+            BankMatchedPlatform = platform,
+            BankMatchScore = lookup.Confidence,
+            SuggestedCondition = condition,
+            Franchise = lookup.Franchise,
+            Edition = string.Empty,
+            CategoryId = "139973",
+            Confidence = decimal.Min(0.98m, decimal.Max(0.78m, lookup.Confidence + 0.2m)),
+            ItemSpecifics = specifics
+        };
+    }
+
     private static string GetDraftDisplayName(InventoryDraft draft)
     {
         return string.IsNullOrWhiteSpace(draft.Input.ItemName) ? "Unnamed item" : draft.Input.ItemName.Trim();
@@ -758,6 +1206,205 @@
         }
 
         return string.Empty;
+    }
+
+    private static string NormalizeBarcodeValue(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        return new string(value
+            .Where(char.IsLetterOrDigit)
+            .Select(char.ToUpperInvariant)
+            .ToArray());
+    }
+
+    private static IReadOnlyList<string> ExpandBarcodeLookupCodes(string normalizedCode)
+    {
+        if (string.IsNullOrWhiteSpace(normalizedCode))
+        {
+            return [];
+        }
+
+        var expanded = new List<string>(4);
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        static void AddCode(List<string> list, HashSet<string> set, string value)
+        {
+            if (string.IsNullOrWhiteSpace(value) || !set.Add(value))
+            {
+                return;
+            }
+
+            list.Add(value);
+        }
+
+        AddCode(expanded, seen, normalizedCode);
+
+        if (normalizedCode.Length == 12 && IsUpcAChecksumValid(normalizedCode))
+        {
+            var ean13 = $"0{normalizedCode}";
+            if (IsEanChecksumValid(ean13))
+            {
+                AddCode(expanded, seen, ean13);
+            }
+        }
+        else if (normalizedCode.Length == 13 &&
+                 normalizedCode.StartsWith('0') &&
+                 IsEanChecksumValid(normalizedCode))
+        {
+            var upca = normalizedCode[1..];
+            if (IsUpcAChecksumValid(upca))
+            {
+                AddCode(expanded, seen, upca);
+            }
+        }
+        else if (normalizedCode.Length == 8 && TryExpandUpceToUpca(normalizedCode, out var upceAsUpca))
+        {
+            AddCode(expanded, seen, upceAsUpca);
+            var ean13 = $"0{upceAsUpca}";
+            if (IsEanChecksumValid(ean13))
+            {
+                AddCode(expanded, seen, ean13);
+            }
+        }
+
+        return expanded;
+    }
+
+    private static bool IsEanChecksumValid(string code)
+    {
+        if (!code.All(char.IsDigit) || code.Length != 13)
+        {
+            return false;
+        }
+
+        var expected = code[^1] - '0';
+        var sum = 0;
+        for (var i = 0; i < 12; i++)
+        {
+            var digit = code[i] - '0';
+            sum += i % 2 == 0 ? digit : digit * 3;
+        }
+
+        return (10 - (sum % 10)) % 10 == expected;
+    }
+
+    private static bool IsUpcAChecksumValid(string code)
+    {
+        if (!code.All(char.IsDigit) || code.Length != 12)
+        {
+            return false;
+        }
+
+        var expected = code[^1] - '0';
+        var oddSum = 0;
+        var evenSum = 0;
+        for (var i = 0; i < 11; i++)
+        {
+            var digit = code[i] - '0';
+            if (i % 2 == 0)
+            {
+                oddSum += digit;
+            }
+            else
+            {
+                evenSum += digit;
+            }
+        }
+
+        var check = (10 - (((oddSum * 3) + evenSum) % 10)) % 10;
+        return check == expected;
+    }
+
+    private static bool TryExpandUpceToUpca(string upce, out string upca)
+    {
+        upca = string.Empty;
+        if (string.IsNullOrWhiteSpace(upce) || upce.Length != 8 || !upce.All(char.IsDigit))
+        {
+            return false;
+        }
+
+        var ns = upce[0];
+        var d1 = upce[1];
+        var d2 = upce[2];
+        var d3 = upce[3];
+        var d4 = upce[4];
+        var d5 = upce[5];
+        var d6 = upce[6];
+        var check = upce[7];
+
+        string body = d6 switch
+        {
+            '0' or '1' or '2' => $"{ns}{d1}{d2}{d6}0000{d3}{d4}{d5}",
+            '3' => $"{ns}{d1}{d2}{d3}00000{d4}{d5}",
+            '4' => $"{ns}{d1}{d2}{d3}{d4}00000{d5}",
+            _ => $"{ns}{d1}{d2}{d3}{d4}{d5}0000{d6}"
+        };
+
+        var candidate = $"{body}{check}";
+        if (!IsUpcAChecksumValid(candidate))
+        {
+            return false;
+        }
+
+        upca = candidate;
+        return true;
+    }
+
+    private static void MergeScanCandidate(
+        IDictionary<string, ExternalBarcodeLookupResult> merged,
+        ExternalBarcodeLookupResult candidate)
+    {
+        if (string.IsNullOrWhiteSpace(candidate.Title))
+        {
+            return;
+        }
+
+        var key = $"{candidate.Title.Trim().ToLowerInvariant()}|{(candidate.Platform ?? string.Empty).Trim().ToLowerInvariant()}";
+        if (!merged.TryGetValue(key, out var existing))
+        {
+            merged[key] = candidate;
+            return;
+        }
+
+        if (candidate.Confidence > existing.Confidence)
+        {
+            merged[key] = candidate;
+        }
+    }
+
+    private static void MergeScanCandidateList(
+        IList<ExternalBarcodeLookupResult> list,
+        ExternalBarcodeLookupResult candidate)
+    {
+        if (string.IsNullOrWhiteSpace(candidate.Title))
+        {
+            return;
+        }
+
+        var normalizedTitle = candidate.Title.Trim().ToLowerInvariant();
+        var normalizedPlatform = (candidate.Platform ?? string.Empty).Trim().ToLowerInvariant();
+        for (var i = 0; i < list.Count; i++)
+        {
+            var existing = list[i];
+            if (!existing.Title.Trim().ToLowerInvariant().Equals(normalizedTitle, StringComparison.Ordinal) ||
+                !(existing.Platform ?? string.Empty).Trim().ToLowerInvariant().Equals(normalizedPlatform, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (candidate.Confidence > existing.Confidence)
+            {
+                list[i] = candidate;
+            }
+
+            return;
+        }
+
+        list.Add(candidate);
     }
 
     private static void ApplyClassificationDefaults(ListingInput input, ClassificationResult classification)
@@ -786,6 +1433,13 @@
         }
     }
 
+    private static string GetDraftSelectedTitle(InventoryDraft draft)
+    {
+        return string.IsNullOrWhiteSpace(draft.Input.ItemName)
+            ? "No title selected"
+            : draft.Input.ItemName.Trim();
+    }
+
     private static string DisplayOrFallback(string? value)
     {
         return string.IsNullOrWhiteSpace(value) ? "-" : value;
@@ -803,9 +1457,552 @@
         _expandedImageName = string.Empty;
     }
 
+    private async Task OpenBarcodeScannerAsync(Guid draftId)
+    {
+        _scannerAddDirectMode = false;
+        _scannerDraftId = draftId;
+        _scannerOpen = true;
+        _scannerPendingStart = true;
+        _scannerStatus = "Starting camera...";
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task OpenScanNewItemAsync()
+    {
+        var draft = CreateDraft(insertAtTop: true);
+        draft.Message = "Scan a barcode to auto-fill this draft.";
+        draft.ErrorMessage = string.Empty;
+        _scannerAddDirectMode = false;
+        _scannerDraftId = draft.Id;
+        _scannerOpen = true;
+        _scannerPendingStart = true;
+        _scannerStatus = "Starting camera...";
+        await PersistDraftsAsync();
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task StartBarcodeScannerAsync()
+    {
+        if (!_scannerOpen || !_scannerDraftId.HasValue)
+        {
+            return;
+        }
+
+        try
+        {
+            _scannerDotNetRef ??= DotNetObjectReference.Create(this);
+            await JSRuntime.InvokeVoidAsync("catalogPilotBarcodeScanner.start", _scannerDotNetRef, BarcodeScannerVideoId);
+            _scannerStatus = "Point camera at a UPC/EAN barcode.";
+        }
+        catch (Exception ex)
+        {
+            _scannerStatus = "Unable to start camera scanner.";
+            _errorMessage = ex.Message;
+        }
+
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task CloseBarcodeScannerAsync()
+    {
+        _scannerOpen = false;
+        _scannerPendingStart = false;
+        _scannerDraftId = null;
+        _scannerAddDirectMode = false;
+        _scannerStatus = string.Empty;
+
+        try
+        {
+            await JSRuntime.InvokeVoidAsync("catalogPilotBarcodeScanner.stop", BarcodeScannerVideoId);
+        }
+        catch
+        {
+            // Ignore scanner shutdown errors.
+        }
+
+        await InvokeAsync(StateHasChanged);
+    }
+
+    [JSInvokable]
+    public async Task OnCameraBarcodeDetected(string rawValue, string format)
+    {
+        var draftId = _scannerDraftId;
+        var addDirectMode = _scannerAddDirectMode;
+        await CloseBarcodeScannerAsync();
+        await PrepareScanResultChoicesAsync(rawValue, format, draftId, addDirectMode);
+    }
+
+    [JSInvokable]
+    public Task OnCameraBarcodeError(string message)
+    {
+        _scannerStatus = string.IsNullOrWhiteSpace(message)
+            ? "Camera barcode scanning is unavailable in this browser."
+            : message;
+        return InvokeAsync(StateHasChanged);
+    }
+
+    private async Task PrepareScanResultChoicesAsync(
+        string rawValue,
+        string format,
+        Guid? draftId,
+        bool addDirectMode)
+    {
+        var workingDraftId = draftId;
+        if (!workingDraftId.HasValue)
+        {
+            var created = CreateDraft(insertAtTop: true);
+            created.Message = "Scanning barcode...";
+            created.ErrorMessage = string.Empty;
+            workingDraftId = created.Id;
+            await PersistDraftsAsync();
+        }
+
+        var normalized = NormalizeBarcodeValue(rawValue);
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            _errorMessage = "Scanned barcode was empty.";
+            _statusMessage = string.Empty;
+            await InvokeAsync(StateHasChanged);
+            return;
+        }
+
+        _errorMessage = string.Empty;
+        _statusMessage = $"Scanned {normalized}. Finding possible matches...";
+
+        // Open picker immediately with a loading state so the user sees progress while lookups run.
+        OpenScanResultPickerLoading(normalized, format, workingDraftId.Value, addDirectMode: false);
+        await InvokeAsync(StateHasChanged);
+
+        try
+        {
+            var draft = _drafts.FirstOrDefault(item => item.Id == workingDraftId.Value);
+            var platformHint = draft?.Input.Platform;
+
+            var mergedCandidates = new Dictionary<string, ExternalBarcodeLookupResult>(StringComparer.Ordinal);
+            var lookupCodes = ExpandBarcodeLookupCodes(normalized);
+            foreach (var lookupCode in lookupCodes.Take(5))
+            {
+                var catalogMatch = await GameCatalogStore.FindByBarcodeAsync(lookupCode, platformHint);
+                if (catalogMatch is not null)
+                {
+                    var fromCatalog = new ExternalBarcodeLookupResult
+                    {
+                        Code = lookupCode,
+                        Title = catalogMatch.Match.Entry.Title,
+                        Platform = catalogMatch.Match.Entry.Platform,
+                        Franchise = catalogMatch.Match.Entry.Franchise,
+                        Provider = "Local Catalog",
+                        Confidence = decimal.Min(0.99m, decimal.Max(0.82m, catalogMatch.Match.Score))
+                    };
+                    MergeScanCandidate(mergedCandidates, fromCatalog);
+                }
+
+                var externalCandidates = await ExternalBarcodeLookupService.LookupCandidatesAsync(
+                    lookupCode,
+                    platformHint,
+                    maxResults: 8);
+                foreach (var candidate in externalCandidates)
+                {
+                    var withCode = string.IsNullOrWhiteSpace(candidate.Code)
+                        ? candidate with { Code = lookupCode }
+                        : candidate;
+                    MergeScanCandidate(mergedCandidates, withCode);
+                }
+            }
+
+            var draftTitleSeed = ResolveValue(
+                draft?.Input.ItemName,
+                draft?.SuggestedClassification?.SuggestedTitle,
+                draft?.SuggestedClassification?.BankMatchedTitle);
+            if (!string.IsNullOrWhiteSpace(draftTitleSeed))
+            {
+                var seedMatches = await GameCatalogStore.SearchSimilarTitlesAsync(
+                    draftTitleSeed,
+                    platformHint,
+                    maxResults: 8);
+                foreach (var match in seedMatches)
+                {
+                    var fromSeed = new ExternalBarcodeLookupResult
+                    {
+                        Code = normalized,
+                        Title = match.Entry.Title,
+                        Platform = match.Entry.Platform,
+                        Franchise = match.Entry.Franchise,
+                        Provider = "Draft OCR Catalog",
+                        Confidence = decimal.Min(0.97m, decimal.Max(0.70m, match.Score + 0.12m))
+                    };
+                    MergeScanCandidate(mergedCandidates, fromSeed);
+                }
+            }
+
+            var candidates = mergedCandidates.Values
+                .OrderByDescending(candidate => candidate.Confidence)
+                .ThenBy(candidate => candidate.Title, StringComparer.OrdinalIgnoreCase)
+                .Take(20)
+                .ToArray();
+
+            ApplyScanResultCandidates(candidates);
+            _statusMessage = candidates.Length == 0
+                ? $"Scanned {normalized}. No automatic matches found."
+                : $"Scanned {normalized}. {candidates.Length} match option(s) found.";
+            _errorMessage = string.Empty;
+        }
+        catch (Exception ex)
+        {
+            _scanResultPickerLoading = false;
+            _errorMessage = ex.Message;
+            _statusMessage = string.Empty;
+        }
+        finally
+        {
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private void OpenScanResultPickerLoading(
+        string normalizedBarcode,
+        string format,
+        Guid? draftId,
+        bool addDirectMode)
+    {
+        var draft = draftId.HasValue
+            ? _drafts.FirstOrDefault(item => item.Id == draftId.Value)
+            : null;
+        _scanResultBarcode = normalizedBarcode;
+        _scanResultFormat = format ?? string.Empty;
+        _scanResultDraftId = draftId;
+        _scanResultAddDirectMode = addDirectMode;
+        _scanResultTitleQuery = ResolveValue(
+            draft?.Input.ItemName,
+            draft?.SuggestedClassification?.BankMatchedTitle,
+            draft?.SuggestedClassification?.SuggestedTitle);
+        _scanResultTitleSearchBusy = false;
+        _scanResultSubmitting = false;
+        _scanResultPickerLoading = true;
+        _scanResultCandidates.Clear();
+        _scanResultPickerOpen = true;
+    }
+
+    private void ApplyScanResultCandidates(IReadOnlyList<ExternalBarcodeLookupResult> candidates)
+    {
+        _scanResultCandidates.Clear();
+        _scanResultCandidates.AddRange(candidates.Take(20));
+        _scanResultPickerLoading = false;
+    }
+
+    private void CloseScanResultPicker()
+    {
+        _scanResultPickerOpen = false;
+        _scanResultPickerLoading = false;
+        _scanResultSubmitting = false;
+        _scanResultAddDirectMode = false;
+        _scanResultDraftId = null;
+        _scanResultBarcode = string.Empty;
+        _scanResultFormat = string.Empty;
+        _scanResultTitleQuery = string.Empty;
+        _scanResultTitleSearchBusy = false;
+        _scanResultCandidates.Clear();
+    }
+
+    private async Task SearchScanResultTitlesAsync()
+    {
+        if (!_scanResultPickerOpen || _scanResultTitleSearchBusy || _scanResultPickerLoading)
+        {
+            return;
+        }
+
+        var query = _scanResultTitleQuery.Trim();
+        if (string.IsNullOrWhiteSpace(query))
+        {
+            _errorMessage = "Enter a title to search the catalog.";
+            _statusMessage = string.Empty;
+            await InvokeAsync(StateHasChanged);
+            return;
+        }
+
+        _scanResultTitleSearchBusy = true;
+        _errorMessage = string.Empty;
+        try
+        {
+            string? platformHint = null;
+            if (_scanResultDraftId.HasValue)
+            {
+                platformHint = _drafts.FirstOrDefault(item => item.Id == _scanResultDraftId.Value)?.Input.Platform;
+            }
+
+            var matches = await GameCatalogStore.SearchSimilarTitlesAsync(query, platformHint, maxResults: 12);
+            foreach (var match in matches)
+            {
+                var fromSearch = new ExternalBarcodeLookupResult
+                {
+                    Code = _scanResultBarcode,
+                    Title = match.Entry.Title,
+                    Platform = match.Entry.Platform,
+                    Franchise = match.Entry.Franchise,
+                    Provider = "Catalog Search",
+                    Confidence = decimal.Min(0.98m, decimal.Max(0.66m, match.Score + 0.15m))
+                };
+                MergeScanCandidateList(_scanResultCandidates, fromSearch);
+            }
+
+            _scanResultCandidates.Sort(static (left, right) =>
+            {
+                var compare = right.Confidence.CompareTo(left.Confidence);
+                if (compare != 0)
+                {
+                    return compare;
+                }
+
+                return string.Compare(left.Title, right.Title, StringComparison.OrdinalIgnoreCase);
+            });
+
+            _statusMessage = matches.Count == 0
+                ? "No catalog title matches found."
+                : $"Added {matches.Count} catalog search match(es).";
+        }
+        catch (Exception ex)
+        {
+            _errorMessage = ex.Message;
+            _statusMessage = string.Empty;
+        }
+        finally
+        {
+            _scanResultTitleSearchBusy = false;
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private async Task SkipScanResultAsync()
+    {
+        var draftId = _scanResultDraftId;
+        var normalized = _scanResultBarcode;
+        var format = _scanResultFormat;
+
+        CloseScanResultPicker();
+
+        if (draftId.HasValue && !string.IsNullOrWhiteSpace(normalized))
+        {
+            await ApplyScannedNoMatchAsync(draftId.Value, normalized, format);
+        }
+    }
+
+    private async Task SelectScanResultAsync(ExternalBarcodeLookupResult candidate)
+    {
+        if (_scanResultSubmitting)
+        {
+            return;
+        }
+
+        _scanResultSubmitting = true;
+        var draftId = _scanResultDraftId;
+        var normalized = _scanResultBarcode;
+        var format = _scanResultFormat;
+        CloseScanResultPicker();
+
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            _errorMessage = "Scanned barcode was empty.";
+            _statusMessage = string.Empty;
+            await InvokeAsync(StateHasChanged);
+            return;
+        }
+
+        if (!draftId.HasValue)
+        {
+            _errorMessage = "No draft target was available for scan results.";
+            _statusMessage = string.Empty;
+            await InvokeAsync(StateHasChanged);
+            return;
+        }
+
+        await ApplyScannedLookupAsync(draftId.Value, normalized, format, candidate);
+    }
+
+    private async Task ApplyScannedNoMatchAsync(Guid draftId, string normalized, string format)
+    {
+        var draft = _drafts.FirstOrDefault(item => item.Id == draftId);
+        if (draft is null)
+        {
+            return;
+        }
+
+        RequestDraftAnalysisCancellation(draft);
+        draft.AnalysisVersion++;
+        draft.IsAnalyzing = false;
+        draft.AnalysisCts = null;
+        draft.ErrorMessage = string.Empty;
+        UpsertAttributeRow(draft, "Detected Game Code", normalized);
+        if (!string.IsNullOrWhiteSpace(format))
+        {
+            UpsertAttributeRow(draft, "Barcode Format", format);
+        }
+
+        draft.Message = $"Scanned {normalized}, but no game match was selected.";
+        await PersistDraftsAsync();
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task ApplyScannedLookupAsync(Guid draftId, string normalized, string format, ExternalBarcodeLookupResult lookup)
+    {
+        var draft = _drafts.FirstOrDefault(item => item.Id == draftId);
+        if (draft is null)
+        {
+            return;
+        }
+
+        RequestDraftAnalysisCancellation(draft);
+        draft.AnalysisVersion++;
+        draft.IsAnalyzing = false;
+        draft.AnalysisCts = null;
+        draft.ErrorMessage = string.Empty;
+        draft.Message = $"Applying selected match for {normalized}...";
+        await InvokeAsync(StateHasChanged);
+
+        try
+        {
+            var classification = BuildScannedBarcodeClassification(draft.Input, lookup, normalized, format);
+            draft.SuggestedClassification = classification;
+            ApplyClassificationDefaults(draft.Input, classification);
+            MergeSuggestedAttributes(draft, classification.ItemSpecifics);
+
+            var pricingInput = CloneListingInput(draft.Input);
+            ApplyClassificationDefaults(pricingInput, classification);
+            draft.SuggestedPricing = await PricingService.SuggestPriceAsync(pricingInput, classification);
+
+            draft.Message = $"Barcode matched: {DisplayOrFallback(classification.SuggestedTitle)}.";
+            draft.ErrorMessage = string.Empty;
+            _statusMessage = "Applied selected scan match.";
+            _errorMessage = string.Empty;
+            await PersistDraftsAsync();
+        }
+        catch (Exception ex)
+        {
+            draft.ErrorMessage = ex.Message;
+            draft.Message = string.Empty;
+        }
+        finally
+        {
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private async Task AddNewItemFromBarcodeAsync(string rawValue, string format)
+    {
+        if (!_authLoaded || _currentUserId == Guid.Empty)
+        {
+            _errorMessage = "You must be signed in to add items.";
+            _statusMessage = string.Empty;
+            await InvokeAsync(StateHasChanged);
+            return;
+        }
+
+        var normalized = NormalizeBarcodeValue(rawValue);
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            _errorMessage = "Scanned barcode was empty.";
+            _statusMessage = string.Empty;
+            await InvokeAsync(StateHasChanged);
+            return;
+        }
+
+        _errorMessage = string.Empty;
+        _statusMessage = $"Scanned {normalized}. Looking up catalog match...";
+        await InvokeAsync(StateHasChanged);
+
+        try
+        {
+            var lookup = await ExternalBarcodeLookupService.LookupAsync(normalized);
+            if (lookup is null || string.IsNullOrWhiteSpace(lookup.Title))
+            {
+                _errorMessage = $"Scanned {normalized}, but no game match was found.";
+                _statusMessage = string.Empty;
+                await InvokeAsync(StateHasChanged);
+                return;
+            }
+
+            await AddNewItemFromLookupAsync(normalized, format, lookup);
+        }
+        catch (Exception ex)
+        {
+            _errorMessage = ex.Message;
+            _statusMessage = string.Empty;
+        }
+        finally
+        {
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private async Task AddNewItemFromLookupAsync(string normalized, string format, ExternalBarcodeLookupResult lookup)
+    {
+        if (!_authLoaded || _currentUserId == Guid.Empty)
+        {
+            _errorMessage = "You must be signed in to add items.";
+            _statusMessage = string.Empty;
+            await InvokeAsync(StateHasChanged);
+            return;
+        }
+
+        var input = new ListingInput
+        {
+            ItemName = lookup.Title.Trim(),
+            Platform = (lookup.Platform ?? string.Empty).Trim(),
+            Condition = "Used",
+            Quantity = 1
+        };
+
+        try
+        {
+            var classification = BuildScannedBarcodeClassification(input, lookup, normalized, format);
+            ApplyClassificationDefaults(input, classification);
+
+            var pricingInput = CloneListingInput(input);
+            ApplyClassificationDefaults(pricingInput, classification);
+            var pricing = await PricingService.SuggestPriceAsync(pricingInput, classification);
+
+            var saved = await InventoryStore.AddItemAsync(
+                _currentUserId,
+                input,
+                classification,
+                pricing);
+
+            _sessionAddedItems.Add(new SessionAddedItem
+            {
+                ItemName = saved.Input.ItemName,
+                Platform = saved.Input.Platform,
+                Quantity = saved.Input.Quantity,
+                Status = saved.Status,
+                AddedUtc = DateTimeOffset.UtcNow
+            });
+
+            _statusMessage = $"Added from scan: {saved.Input.ItemName} ({saved.Status}).";
+            _errorMessage = string.Empty;
+            await PersistDraftsAsync();
+        }
+        catch (Exception ex)
+        {
+            _errorMessage = ex.Message;
+            _statusMessage = string.Empty;
+        }
+        finally
+        {
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
         CancelAllDraftAnalyses();
+
+        try
+        {
+            await CloseBarcodeScannerAsync();
+        }
+        catch
+        {
+            // Ignore scanner shutdown errors during dispose.
+        }
+        _scannerDotNetRef?.Dispose();
 
         if (_autosaveCts is not null)
         {
@@ -1026,6 +2223,12 @@
         draft.PostSaveAutofillState = null;
         draft.PostSaveAutofillCompleted = false;
         draft.ShowAttributes = false;
+        draft.ShowPhotoSourcePicker = false;
+        draft.ShowTitlePicker = false;
+        draft.TitleSearchQuery = string.Empty;
+        draft.TitleSearchResults.Clear();
+        draft.TitleSearchBusy = false;
+        draft.TitleSearchStatus = string.Empty;
         draft.IsAnalyzing = false;
         draft.IsSaving = false;
     }
@@ -1110,6 +2313,18 @@
         public bool PostSaveAutofillCompleted { get; set; }
 
         public bool ShowAttributes { get; set; }
+
+        public bool ShowPhotoSourcePicker { get; set; }
+
+        public bool ShowTitlePicker { get; set; }
+
+        public string TitleSearchQuery { get; set; } = string.Empty;
+
+        public List<GameTitleMatchResult> TitleSearchResults { get; set; } = [];
+
+        public bool TitleSearchBusy { get; set; }
+
+        public string TitleSearchStatus { get; set; } = string.Empty;
 
         public bool IsAnalyzing { get; set; }
 

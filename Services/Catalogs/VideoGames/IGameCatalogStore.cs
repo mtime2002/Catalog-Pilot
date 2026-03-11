@@ -22,6 +22,11 @@ public interface IGameCatalogStore
 
     Task UpsertBarcodeAsync(string code, GameTitleBankEntry entry, string source, decimal confidence, CancellationToken cancellationToken = default);
 
+    Task PromoteTitleToCuratedAsync(
+        GameTitleBankEntry entry,
+        string source,
+        CancellationToken cancellationToken = default);
+
     Task<CatalogBarcodeMatchResult?> FindByBarcodeAsync(string code, string? platformHint = null, CancellationToken cancellationToken = default);
 
     Task<IReadOnlyList<GameTitleMatchResult>> SearchSimilarTitlesAsync(

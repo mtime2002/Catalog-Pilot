@@ -530,7 +530,8 @@ pre {
 
 .inventory-condensed-media {
     display: flex;
-    gap: 0.55rem;
+    flex-direction: column;
+    gap: 0.45rem;
     width: fit-content;
     min-width: 170px;
     max-width: clamp(170px, 34vw, 360px);
@@ -556,6 +557,129 @@ pre {
 
 .inventory-condensed-main > .attributes-drawer {
     grid-column: 1 / -1;
+}
+
+.inventory-title-selector {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    min-width: 0;
+}
+
+.inventory-title-selector-label {
+    font-size: 0.9rem;
+    font-weight: 600;
+}
+
+.inventory-title-selector-controls {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    gap: 0.4rem;
+    align-items: center;
+}
+
+.inventory-title-current {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: #ffffff;
+    min-height: 2.3rem;
+    padding: 0.5rem 0.65rem;
+    text-align: left;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.inventory-title-current-empty {
+    color: var(--muted);
+}
+
+.inventory-title-clear,
+.inventory-title-toggle {
+    min-height: 2.3rem;
+    white-space: nowrap;
+}
+
+.inventory-title-toggle {
+    min-width: 2.5rem;
+    padding: 0 0.55rem;
+}
+
+.inventory-title-picker {
+    margin-top: 4.2rem;
+    border: 1px solid #dbe3ef;
+    border-radius: 10px;
+    background: #f8fafc;
+    padding: 0.55rem;
+    position: absolute;
+}
+
+.inventory-title-search-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 0.45rem;
+    align-items: center;
+}
+
+.inventory-title-loading,
+.scan-result-loading {
+    margin-top: 0.45rem;
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    color: var(--muted);
+    font-size: 0.9rem;
+}
+
+.inventory-loading-dot {
+    width: 0.62rem;
+    height: 0.62rem;
+    border-radius: 999px;
+    background: #0ea5e9;
+    animation: inventory-loading-pulse 0.95s ease-in-out infinite;
+}
+
+.inventory-title-results {
+    margin-top: 0.5rem;
+    display: grid;
+    gap: 0.4rem;
+    max-height: 220px;
+    overflow-y: auto;
+}
+
+.inventory-title-result {
+    width: 100%;
+    text-align: left;
+    border: 1px solid #d1d9e6;
+    background: #ffffff;
+    border-radius: 8px;
+    padding: 0.45rem 0.55rem;
+    cursor: pointer;
+    display: grid;
+    gap: 0.2rem;
+}
+
+.inventory-title-result:hover:not(:disabled) {
+    border-color: #94a3b8;
+    background: #f1f5f9;
+}
+
+.inventory-title-result:disabled {
+    opacity: 0.65;
+    cursor: not-allowed;
+}
+
+.inventory-title-result-title {
+    font-weight: 600;
+}
+
+.inventory-title-result-meta {
+    color: var(--muted);
+    font-size: 0.82rem;
+    display: flex;
+    gap: 0.5rem 0.75rem;
+    flex-wrap: wrap;
 }
 
 .inventory-condensed-title-row {
@@ -639,6 +763,12 @@ pre {
     text-transform: uppercase;
 }
 
+.inventory-photo-source-picker {
+    display: flex;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+}
+
 .inventory-thumb-input {
     display: none;
 }
@@ -655,6 +785,86 @@ pre {
     object-fit: contain;
     border-radius: 10px;
     background: #0f172a;
+}
+
+.barcode-scanner-card {
+    width: min(760px, 96vw);
+    max-height: 92vh;
+    overflow: auto;
+}
+
+.barcode-scanner-video {
+    width: 100%;
+    max-height: 72vh;
+    border-radius: 10px;
+    background: #020617;
+    border: 1px solid #334155;
+}
+
+.scan-result-picker-card {
+    width: min(760px, 96vw);
+    max-height: 92vh;
+    overflow: auto;
+}
+
+.scan-result-list {
+    display: grid;
+    gap: 0.55rem;
+    margin: 0.75rem 0 1rem;
+}
+
+.scan-result-search-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 0.5rem;
+    align-items: center;
+    margin-top: 0.55rem;
+}
+
+.scan-result-option {
+    width: 100%;
+    text-align: left;
+    border: 1px solid var(--border);
+    background: #f8fafc;
+    border-radius: 10px;
+    padding: 0.65rem 0.75rem;
+    color: var(--text);
+    cursor: pointer;
+}
+
+.scan-result-option:hover:not(:disabled) {
+    border-color: #94a3b8;
+    background: #f1f5f9;
+}
+
+.scan-result-option:disabled {
+    cursor: not-allowed;
+    opacity: 0.65;
+}
+
+.scan-result-title {
+    font-weight: 700;
+}
+
+.scan-result-meta {
+    margin-top: 0.25rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 0.75rem;
+    color: var(--muted);
+    font-size: 0.9rem;
+}
+
+@keyframes inventory-loading-pulse {
+    0%, 100% {
+        opacity: 0.35;
+        transform: scale(0.86);
+    }
+
+    50% {
+        opacity: 1;
+        transform: scale(1);
+    }
 }
 
 @media (max-width: 680px) {
